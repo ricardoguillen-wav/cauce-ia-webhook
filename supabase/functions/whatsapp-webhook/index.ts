@@ -15,29 +15,24 @@ const corsHeaders = {
 };
 
 async function sendText(to: string, text: string) {
-  console.log("sendText →", to, text);
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({ to, type: "text", text: { body: text } }),
   });
-  const resBody = await res.text();
-  console.log("sendText response:", res.status, resBody);
+  console.log("sendText:", res.status, await res.text());
 }
 
 async function sendImage(to: string, url: string, caption?: string) {
-  console.log("sendImage →", to, url);
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({ to, type: "image", image: { link: url, caption: caption || "" } }),
   });
-  const resBody = await res.text();
-  console.log("sendImage response:", res.status, resBody);
+  console.log("sendImage:", res.status, await res.text());
 }
 
 async function sendButtons(to: string, text: string, options: { label: string; value: string }[]) {
-  console.log("sendButtons →", to, text, options);
   const buttons = options.slice(0, 3).map((o) => ({
     type: "reply",
     reply: { id: o.value, title: o.label.slice(0, 20) },
@@ -46,17 +41,11 @@ async function sendButtons(to: string, text: string, options: { label: string; v
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({
-      to,
-      type: "interactive",
-      interactive: {
-        type: "button",
-        body: { text },
-        action: { buttons },
-      },
+      to, type: "interactive",
+      interactive: { type: "button", body: { text }, action: { buttons } },
     }),
   });
-  const resBody = await res.text();
-  console.log("sendButtons response:", res.status, resBody);
+  console.log("sendButtons:", res.status, await res.text());
 }
 
 async function executeNode(phone: string, node: any) {
@@ -88,115 +77,82 @@ async function resolveVariables(text: string, phone: string): Promise<string> {
 async function processMessage(phone: string, userMessage: string) {
   console.log("processMessage — phone:", phone, "msg:", userMessage);
 
-  const { data: session, error: sessionError } = await sb
-    .from("sessions").select("*").eq("phone", phone).maybeSingle();
-  console.log("session:", JSON.stringify(session), "sessionError:", JSON.stringify(sessionError));
+  const { data: session, error: se } = await sb.from("sessions").select("*").eq("phone", phone).maybeSingle();
+  console.log("session:", JSON.stringify(session), "err:", JSON.stringify(se));
 
   if (!session) {
-    console.log("No session — looking for active flow...");
-    const { data: flow, error: flowError } = await sb
-      .from("flows").select("id").eq("is_active", true).maybeSingle();
-    console.log("flow:", JSON.stringify(flow), "flowError:", JSON.stringify(flowError));
+    const { data: flow, error: fe } = await sb.from("flows").select("id").eq("is_active", true).maybeSingle();
+    console.log("flow:", JSON.stringify(flow), "err:", JSON.stringify(fe));
     if (!flow) { console.log("NO ACTIVE FLOW"); return; }
 
-    const { data: firstNode, error: nodeError } = await sb
-      .from("nodes").select("*")
-      .eq("flow_id", flow.id)
-      .order("created_at", { ascending: true })
-      .limit(1).maybeSingle();
-    console.log("firstNode:", JSON.stringify(firstNode), "nodeError:", JSON.stringify(nodeError));
-    if (!firstNode) { console.log("NO NODES IN FLOW"); return; }
+    const { data: firstNode, error: ne } = await sb.from("nodes").select("*")
+      .eq("flow_id", flow.id).order("created_at", { ascending: true }).limit(1).maybeSingle();
+    console.log("firstNode:", JSON.stringify(firstNode), "err:", JSON.stringify(ne));
+    if (!firstNode) { console.log("NO NODES"); return; }
 
-    const { error: upsertContactError } = await sb.from("contacts").upsert(
+    await sb.from("contacts").upsert(
       { phone, flow_id: flow.id, status: "nuevo", updated_at: new Date().toISOString() },
       { onConflict: "phone" }
     );
-    console.log("upsertContact error:", JSON.stringify(upsertContactError));
-
-    const { error: upsertSessionError } = await sb.from("sessions").upsert(
+    await sb.from("sessions").upsert(
       { phone, flow_id: flow.id, current_node: firstNode.node_key, updated_at: new Date().toISOString() },
       { onConflict: "phone" }
     );
-    console.log("upsertSession error:", JSON.stringify(upsertSessionError));
 
     const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone) };
     await executeNode(phone, nodeToSend);
     return;
   }
 
-  console.log("Session found — current_node:", session.current_node);
+  console.log("Session found — node:", session.current_node);
+  await sb.from("message_log").insert({ phone, direction: "in", content: userMessage, node_key: session.current_node });
 
-  await sb.from("message_log").insert({
-    phone, direction: "in", content: userMessage, node_key: session.current_node,
-  });
-
-  const { data: currentNode, error: currentNodeError } = await sb
-    .from("nodes").select("*")
-    .eq("flow_id", session.flow_id)
-    .eq("node_key", session.current_node)
-    .maybeSingle();
-  console.log("currentNode:", JSON.stringify(currentNode), "error:", JSON.stringify(currentNodeError));
+  const { data: currentNode } = await sb.from("nodes").select("*")
+    .eq("flow_id", session.flow_id).eq("node_key", session.current_node).maybeSingle();
+  console.log("currentNode:", JSON.stringify(currentNode));
 
   if (currentNode?.capture_field) {
-    console.log("Capturing field:", currentNode.capture_field, "=", userMessage);
     const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
     if (contact) {
-      const { error: captureError } = await sb.from("contact_data").upsert(
+      await sb.from("contact_data").upsert(
         { contact_id: contact.id, field_key: currentNode.capture_field, field_value: userMessage.trim() },
         { onConflict: "contact_id,field_key" }
       );
-      console.log("captureError:", JSON.stringify(captureError));
+      console.log("Captured:", currentNode.capture_field, "=", userMessage.trim());
     }
   }
 
-  let { data: edge, error: edgeError } = await sb
-    .from("edges").select("*")
-    .eq("flow_id", session.flow_id)
-    .eq("from_node", session.current_node)
-    .ilike("condition", userMessage.trim())
-    .maybeSingle();
-  console.log("edge (condition match):", JSON.stringify(edge), "error:", JSON.stringify(edgeError));
+  let { data: edge } = await sb.from("edges").select("*")
+    .eq("flow_id", session.flow_id).eq("from_node", session.current_node)
+    .ilike("condition", userMessage.trim()).maybeSingle();
+  console.log("edge (condition):", JSON.stringify(edge));
 
   if (!edge) {
-    const { data: freeEdge, error: freeEdgeError } = await sb
-      .from("edges").select("*")
-      .eq("flow_id", session.flow_id)
-      .eq("from_node", session.current_node)
-      .is("condition", null)
-      .maybeSingle();
-    console.log("freeEdge:", JSON.stringify(freeEdge), "error:", JSON.stringify(freeEdgeError));
+    const { data: freeEdge } = await sb.from("edges").select("*")
+      .eq("flow_id", session.flow_id).eq("from_node", session.current_node)
+      .is("condition", null).maybeSingle();
+    console.log("freeEdge:", JSON.stringify(freeEdge));
     edge = freeEdge;
   }
 
   if (!edge) {
-    console.log("NO EDGE FOUND — sending fallback message");
     await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.");
     return;
   }
 
-  const { data: nextNode, error: nextNodeError } = await sb
-    .from("nodes").select("*")
-    .eq("flow_id", session.flow_id)
-    .eq("node_key", edge.to_node)
-    .maybeSingle();
-  console.log("nextNode:", JSON.stringify(nextNode), "error:", JSON.stringify(nextNodeError));
+  const { data: nextNode } = await sb.from("nodes").select("*")
+    .eq("flow_id", session.flow_id).eq("node_key", edge.to_node).maybeSingle();
+  console.log("nextNode:", JSON.stringify(nextNode));
   if (!nextNode) { console.log("NEXT NODE NOT FOUND:", edge.to_node); return; }
 
-  await sb.from("sessions").update({
-    current_node: edge.to_node,
-    updated_at: new Date().toISOString(),
-  }).eq("phone", phone);
+  await sb.from("sessions").update({ current_node: edge.to_node, updated_at: new Date().toISOString() }).eq("phone", phone);
 
   const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
   await executeNode(phone, nodeToSend);
 
   if (nextNode.type === "end") {
-    console.log("END NODE — cleaning session");
     await sb.from("sessions").delete().eq("phone", phone);
-    await sb.from("contacts").update({
-      status: "en_proceso",
-      updated_at: new Date().toISOString(),
-    }).eq("phone", phone);
+    await sb.from("contacts").update({ status: "en_proceso", updated_at: new Date().toISOString() }).eq("phone", phone);
   }
 }
 
@@ -210,7 +166,7 @@ Deno.serve(async (req) => {
 
   try {
     const body = await req.json();
-    console.log("Webhook body:", JSON.stringify(body));
+    console.log("Body:", JSON.stringify(body));
 
     let phone = "";
     let userMessage = "";
@@ -237,10 +193,19 @@ Deno.serve(async (req) => {
       else if (msg.type === "button") userMessage = msg.button?.payload || "";
     }
 
-    console.log("Parsed — phone:", phone, "message:", userMessage);
+    console.log("Parsed — phone:", phone, "msg:", userMessage);
 
+    // ── Responder inmediatamente a yCloud y procesar en background ──
     if (phone && userMessage) {
-      await processMessage(phone, userMessage);
+      const response = new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+
+      // Procesar el mensaje DESPUÉS de responder para evitar EarlyDrop
+      (globalThis as any).EdgeRuntime?.waitUntil(processMessage(phone, userMessage));
+
+      return response;
     }
 
     return new Response(JSON.stringify({ ok: true }), {
