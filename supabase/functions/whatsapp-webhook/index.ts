@@ -20,7 +20,7 @@ const corsHeaders = {
 
 async function sendText(to: string, text: string) {
   const payload = { from: YCLOUD_FROM, to, type: "text", text: { body: text } };
-  console.log("sendText payload JSON:", JSON.stringify(payload));
+  console.log("sendText payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
@@ -30,8 +30,14 @@ async function sendText(to: string, text: string) {
 }
 
 async function sendImage(to: string, url: string, caption?: string) {
-  const payload = { from: YCLOUD_FROM, to, type: "image", image: { link: url, caption: caption || "" } };
-  console.log("sendImage payload JSON:", JSON.stringify(payload));
+  const payload: any = {
+    from: YCLOUD_FROM,
+    to,
+    type: "image",
+    image: { link: url }
+  };
+  if (caption) payload.image.caption = caption;
+  console.log("sendImage payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
@@ -51,7 +57,7 @@ async function sendButtons(to: string, text: string, options: { label: string; v
     type: "interactive",
     interactive: { type: "button", body: { text }, action: { buttons } },
   };
-  console.log("sendButtons payload JSON:", JSON.stringify(payload));
+  console.log("sendButtons payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
@@ -80,7 +86,7 @@ async function resolveVariables(text: string, phone: string): Promise<string> {
   if (!contact) return text;
   const { data: fields } = await sb.from("contact_data").select("field_key, field_value").eq("contact_id", contact.id);
   let resolved = text;
-  (fields || []).forEach(f => {
+  (fields || []).forEach((f: any) => {
     resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
   });
   return resolved;
