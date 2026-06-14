@@ -15,27 +15,34 @@ const corsHeaders = {
 };
 
 async function sendText(to: string, text: string) {
-  await fetch(YCLOUD_URL, {
+  console.log("sendText →", to, text);
+  const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({ to, type: "text", text: { body: text } }),
   });
+  const resBody = await res.text();
+  console.log("sendText response:", res.status, resBody);
 }
 
 async function sendImage(to: string, url: string, caption?: string) {
-  await fetch(YCLOUD_URL, {
+  console.log("sendImage →", to, url);
+  const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({ to, type: "image", image: { link: url, caption: caption || "" } }),
   });
+  const resBody = await res.text();
+  console.log("sendImage response:", res.status, resBody);
 }
 
 async function sendButtons(to: string, text: string, options: { label: string; value: string }[]) {
+  console.log("sendButtons →", to, text, options);
   const buttons = options.slice(0, 3).map((o) => ({
     type: "reply",
     reply: { id: o.value, title: o.label.slice(0, 20) },
   }));
-  await fetch(YCLOUD_URL, {
+  const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({
@@ -48,9 +55,12 @@ async function sendButtons(to: string, text: string, options: { label: string; v
       },
     }),
   });
+  const resBody = await res.text();
+  console.log("sendButtons response:", res.status, resBody);
 }
 
 async function executeNode(phone: string, node: any) {
+  console.log("executeNode:", node.node_key, "type:", node.type);
   if (node.media_url) {
     await sendImage(phone, node.media_url, node.content || "");
     if (node.options?.length) await sendButtons(phone, "Elige una opción:", node.options);
@@ -76,87 +86,101 @@ async function resolveVariables(text: string, phone: string): Promise<string> {
 }
 
 async function processMessage(phone: string, userMessage: string) {
-  const { data: session } = await sb.from("sessions").select("*").eq("phone", phone).maybeSingle();
+  console.log("processMessage — phone:", phone, "msg:", userMessage);
+
+  const { data: session, error: sessionError } = await sb
+    .from("sessions").select("*").eq("phone", phone).maybeSingle();
+  console.log("session:", JSON.stringify(session), "sessionError:", JSON.stringify(sessionError));
 
   if (!session) {
-    const { data: flow } = await sb.from("flows").select("id").eq("is_active", true).maybeSingle();
-    if (!flow) return;
+    console.log("No session — looking for active flow...");
+    const { data: flow, error: flowError } = await sb
+      .from("flows").select("id").eq("is_active", true).maybeSingle();
+    console.log("flow:", JSON.stringify(flow), "flowError:", JSON.stringify(flowError));
+    if (!flow) { console.log("NO ACTIVE FLOW"); return; }
 
-    const { data: firstNode } = await sb
-      .from("nodes")
-      .select("*")
+    const { data: firstNode, error: nodeError } = await sb
+      .from("nodes").select("*")
       .eq("flow_id", flow.id)
       .order("created_at", { ascending: true })
-      .limit(1)
-      .maybeSingle();
-    if (!firstNode) return;
+      .limit(1).maybeSingle();
+    console.log("firstNode:", JSON.stringify(firstNode), "nodeError:", JSON.stringify(nodeError));
+    if (!firstNode) { console.log("NO NODES IN FLOW"); return; }
 
-    await sb.from("contacts").upsert(
+    const { error: upsertContactError } = await sb.from("contacts").upsert(
       { phone, flow_id: flow.id, status: "nuevo", updated_at: new Date().toISOString() },
       { onConflict: "phone" }
     );
-    await sb.from("sessions").upsert(
+    console.log("upsertContact error:", JSON.stringify(upsertContactError));
+
+    const { error: upsertSessionError } = await sb.from("sessions").upsert(
       { phone, flow_id: flow.id, current_node: firstNode.node_key, updated_at: new Date().toISOString() },
       { onConflict: "phone" }
     );
+    console.log("upsertSession error:", JSON.stringify(upsertSessionError));
 
     const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone) };
     await executeNode(phone, nodeToSend);
     return;
   }
 
+  console.log("Session found — current_node:", session.current_node);
+
   await sb.from("message_log").insert({
     phone, direction: "in", content: userMessage, node_key: session.current_node,
   });
 
-  const { data: currentNode } = await sb
-    .from("nodes")
-    .select("*")
+  const { data: currentNode, error: currentNodeError } = await sb
+    .from("nodes").select("*")
     .eq("flow_id", session.flow_id)
     .eq("node_key", session.current_node)
     .maybeSingle();
+  console.log("currentNode:", JSON.stringify(currentNode), "error:", JSON.stringify(currentNodeError));
 
   if (currentNode?.capture_field) {
+    console.log("Capturing field:", currentNode.capture_field, "=", userMessage);
     const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
     if (contact) {
-      await sb.from("contact_data").upsert(
+      const { error: captureError } = await sb.from("contact_data").upsert(
         { contact_id: contact.id, field_key: currentNode.capture_field, field_value: userMessage.trim() },
         { onConflict: "contact_id,field_key" }
       );
+      console.log("captureError:", JSON.stringify(captureError));
     }
   }
 
-  let { data: edge } = await sb
-    .from("edges")
-    .select("*")
+  let { data: edge, error: edgeError } = await sb
+    .from("edges").select("*")
     .eq("flow_id", session.flow_id)
     .eq("from_node", session.current_node)
     .ilike("condition", userMessage.trim())
     .maybeSingle();
+  console.log("edge (condition match):", JSON.stringify(edge), "error:", JSON.stringify(edgeError));
 
   if (!edge) {
-    const { data: freeEdge } = await sb
-      .from("edges")
-      .select("*")
+    const { data: freeEdge, error: freeEdgeError } = await sb
+      .from("edges").select("*")
       .eq("flow_id", session.flow_id)
       .eq("from_node", session.current_node)
       .is("condition", null)
       .maybeSingle();
+    console.log("freeEdge:", JSON.stringify(freeEdge), "error:", JSON.stringify(freeEdgeError));
     edge = freeEdge;
   }
 
   if (!edge) {
+    console.log("NO EDGE FOUND — sending fallback message");
     await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.");
     return;
   }
 
-  const { data: nextNode } = await sb
-    .from("nodes")
-    .select("*")
+  const { data: nextNode, error: nextNodeError } = await sb
+    .from("nodes").select("*")
     .eq("flow_id", session.flow_id)
     .eq("node_key", edge.to_node)
     .maybeSingle();
-  if (!nextNode) return;
+  console.log("nextNode:", JSON.stringify(nextNode), "error:", JSON.stringify(nextNodeError));
+  if (!nextNode) { console.log("NEXT NODE NOT FOUND:", edge.to_node); return; }
 
   await sb.from("sessions").update({
     current_node: edge.to_node,
@@ -167,6 +191,7 @@ async function processMessage(phone: string, userMessage: string) {
   await executeNode(phone, nodeToSend);
 
   if (nextNode.type === "end") {
+    console.log("END NODE — cleaning session");
     await sb.from("sessions").delete().eq("phone", phone);
     await sb.from("contacts").update({
       status: "en_proceso",
@@ -190,27 +215,20 @@ Deno.serve(async (req) => {
     let phone = "";
     let userMessage = "";
 
-    // Formato real de yCloud
     if (body?.whatsappInboundMessage) {
       const msg = body.whatsappInboundMessage;
       phone = msg.from || "";
-      if (msg.type === "text") {
-        userMessage = msg.text?.body || "";
-      } else if (msg.type === "interactive") {
-        userMessage = msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id || "";
-      } else if (msg.type === "button") {
-        userMessage = msg.button?.payload || msg.button?.text || "";
-      }
+      if (msg.type === "text") userMessage = msg.text?.body || "";
+      else if (msg.type === "interactive") userMessage = msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id || "";
+      else if (msg.type === "button") userMessage = msg.button?.payload || msg.button?.text || "";
     }
 
-    // Formato Meta alternativo
     if (!phone && body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
       const msg = body.entry[0].changes[0].value.messages[0];
       phone = msg.from || "";
       userMessage = msg.text?.body || msg.interactive?.button_reply?.id || "";
     }
 
-    // Formato legacy yCloud
     if (!phone && body?.message) {
       const msg = body.message;
       phone = msg.from || "";
