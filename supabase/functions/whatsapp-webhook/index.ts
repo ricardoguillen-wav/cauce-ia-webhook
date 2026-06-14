@@ -9,9 +9,6 @@ const YCLOUD_KEY  = Deno.env.get("YCLOUD_API_KEY")!;
 const YCLOUD_FROM = "+526181239810";
 const YCLOUD_URL  = "https://api.ycloud.com/v2/whatsapp/messages";
 
-console.log("INIT — YCLOUD_FROM:", YCLOUD_FROM);
-console.log("INIT — YCLOUD_KEY length:", YCLOUD_KEY?.length);
-
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -30,12 +27,7 @@ async function sendText(to: string, text: string) {
 }
 
 async function sendImage(to: string, url: string, caption?: string) {
-  const payload: any = {
-    from: YCLOUD_FROM,
-    to,
-    type: "image",
-    image: { link: url }
-  };
+  const payload: any = { from: YCLOUD_FROM, to, type: "image", image: { link: url } };
   if (caption) payload.image.caption = caption;
   console.log("sendImage payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
@@ -52,9 +44,7 @@ async function sendButtons(to: string, text: string, options: { label: string; v
     reply: { id: o.value, title: o.label.slice(0, 20) },
   }));
   const payload = {
-    from: YCLOUD_FROM,
-    to,
-    type: "interactive",
+    from: YCLOUD_FROM, to, type: "interactive",
     interactive: { type: "button", body: { text }, action: { buttons } },
   };
   console.log("sendButtons payload:", JSON.stringify(payload));
@@ -64,20 +54,6 @@ async function sendButtons(to: string, text: string, options: { label: string; v
     body: JSON.stringify(payload),
   });
   console.log("sendButtons response:", res.status, await res.text());
-}
-
-async function executeNode(phone: string, node: any) {
-  console.log("executeNode:", node.node_key, "type:", node.type);
-  if (node.media_url) {
-    await sendImage(phone, node.media_url, node.content || "");
-    if (node.options?.length) await sendButtons(phone, "Elige una opción:", node.options);
-    return;
-  }
-  if (node.options?.length) {
-    await sendButtons(phone, node.content || "Elige una opción:", node.options);
-    return;
-  }
-  if (node.content) await sendText(phone, node.content);
 }
 
 async function resolveVariables(text: string, phone: string): Promise<string> {
@@ -90,6 +66,69 @@ async function resolveVariables(text: string, phone: string): Promise<string> {
     resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
   });
   return resolved;
+}
+
+async function autoAdvanceNode(phone: string, node: any) {
+  console.log("autoAdvance desde:", node.node_key);
+
+  const { data: session } = await sb.from("sessions").select("flow_id").eq("phone", phone).maybeSingle();
+  if (!session) return;
+
+  const { data: edge } = await sb.from("edges").select("*")
+    .eq("flow_id", session.flow_id)
+    .eq("from_node", node.node_key)
+    .is("condition", null)
+    .maybeSingle();
+  console.log("autoAdvance edge:", JSON.stringify(edge));
+  if (!edge) return;
+
+  const { data: nextNode } = await sb.from("nodes").select("*")
+    .eq("flow_id", session.flow_id)
+    .eq("node_key", edge.to_node)
+    .maybeSingle();
+  console.log("autoAdvance nextNode:", JSON.stringify(nextNode));
+  if (!nextNode) return;
+
+  await sb.from("sessions").update({
+    current_node: edge.to_node,
+    updated_at: new Date().toISOString(),
+  }).eq("phone", phone);
+
+  const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
+  await executeNode(phone, nodeToSend);
+
+  if (nextNode.type === "end") {
+    await sb.from("sessions").delete().eq("phone", phone);
+    await sb.from("contacts").update({
+      status: "en_proceso",
+      updated_at: new Date().toISOString(),
+    }).eq("phone", phone);
+  }
+}
+
+async function executeNode(phone: string, node: any, autoAdvance = true) {
+  console.log("executeNode:", node.node_key, "type:", node.type);
+
+  if (node.media_url) {
+    await sendImage(phone, node.media_url, node.content || "");
+    if (node.options?.length) {
+      await sendButtons(phone, "Elige una opción:", node.options);
+    } else if (autoAdvance) {
+      await autoAdvanceNode(phone, node);
+    }
+    return;
+  }
+
+  if (node.options?.length) {
+    await sendButtons(phone, node.content || "Elige una opción:", node.options);
+    return;
+  }
+
+  if (node.content) await sendText(phone, node.content);
+
+  if (node.type === "message" && autoAdvance) {
+    await autoAdvanceNode(phone, node);
+  }
 }
 
 async function processMessage(phone: string, userMessage: string) {
