@@ -5,9 +5,8 @@ const sb = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const YCLOUD_KEY   = Deno.env.get("YCLOUD_API_KEY")!;
-const YCLOUD_PHONE = Deno.env.get("YCLOUD_PHONE")!;
-const YCLOUD_URL   = "https://api.ycloud.com/v2/whatsapp/messages";
+const YCLOUD_KEY = Deno.env.get("YCLOUD_API_KEY")!;
+const YCLOUD_URL = "https://api.ycloud.com/v2/whatsapp/messages";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -20,7 +19,6 @@ async function sendText(to: string, text: string) {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({
-      from: YCLOUD_PHONE,
       to,
       type: "text",
       text: { body: text },
@@ -34,7 +32,6 @@ async function sendImage(to: string, url: string, caption?: string) {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({
-      from: YCLOUD_PHONE,
       to,
       type: "image",
       image: { link: url, caption: caption || "" },
@@ -52,7 +49,6 @@ async function sendButtons(to: string, text: string, options: { label: string; v
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({
-      from: YCLOUD_PHONE,
       to,
       type: "interactive",
       interactive: {
