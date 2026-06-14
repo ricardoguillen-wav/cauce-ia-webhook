@@ -5,8 +5,9 @@ const sb = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const YCLOUD_KEY = Deno.env.get("YCLOUD_API_KEY")!;
-const YCLOUD_URL = "https://api.ycloud.com/v2/whatsapp/messages";
+const YCLOUD_KEY  = Deno.env.get("YCLOUD_API_KEY")!;
+const YCLOUD_FROM = "+526181239810";
+const YCLOUD_URL  = "https://api.ycloud.com/v2/whatsapp/messages";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -15,27 +16,23 @@ const corsHeaders = {
 };
 
 async function sendText(to: string, text: string) {
+  const payload = { from: YCLOUD_FROM, to, type: "text", text: { body: text } };
+  console.log("sendText payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
-    body: JSON.stringify({
-      to,
-      type: "text",
-      text: { body: text },
-    }),
+    body: JSON.stringify(payload),
   });
   console.log("sendText:", res.status, await res.text());
 }
 
 async function sendImage(to: string, url: string, caption?: string) {
+  const payload = { from: YCLOUD_FROM, to, type: "image", image: { link: url, caption: caption || "" } };
+  console.log("sendImage payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
-    body: JSON.stringify({
-      to,
-      type: "image",
-      image: { link: url, caption: caption || "" },
-    }),
+    body: JSON.stringify(payload),
   });
   console.log("sendImage:", res.status, await res.text());
 }
@@ -45,18 +42,17 @@ async function sendButtons(to: string, text: string, options: { label: string; v
     type: "reply",
     reply: { id: o.value, title: o.label.slice(0, 20) },
   }));
+  const payload = {
+    from: YCLOUD_FROM,
+    to,
+    type: "interactive",
+    interactive: { type: "button", body: { text }, action: { buttons } },
+  };
+  console.log("sendButtons payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
-    body: JSON.stringify({
-      to,
-      type: "interactive",
-      interactive: {
-        type: "button",
-        body: { text },
-        action: { buttons },
-      },
-    }),
+    body: JSON.stringify(payload),
   });
   console.log("sendButtons:", res.status, await res.text());
 }
@@ -98,14 +94,12 @@ async function processMessage(phone: string, userMessage: string) {
     console.log("flow:", JSON.stringify(flow), "err:", JSON.stringify(fe));
     if (!flow) { console.log("NO ACTIVE FLOW"); return; }
 
-    // Buscar nodo marcado como inicio
     let { data: firstNode } = await sb.from("nodes").select("*")
       .eq("flow_id", flow.id).eq("is_start", true).maybeSingle();
     console.log("firstNode (is_start):", JSON.stringify(firstNode));
 
-    // Fallback: primer nodo por created_at
     if (!firstNode) {
-      console.log("No is_start — usando fallback por created_at");
+      console.log("No is_start — fallback por created_at");
       const { data: fallback } = await sb.from("nodes").select("*")
         .eq("flow_id", flow.id).order("created_at", { ascending: true }).limit(1).maybeSingle();
       firstNode = fallback;
