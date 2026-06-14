@@ -136,6 +136,7 @@ async function processMessage(phone: string, userMessage: string) {
   }
 
   if (!edge) {
+    console.log("NO EDGE FOUND");
     await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.");
     return;
   }
@@ -195,17 +196,8 @@ Deno.serve(async (req) => {
 
     console.log("Parsed — phone:", phone, "msg:", userMessage);
 
-    // ── Responder inmediatamente a yCloud y procesar en background ──
     if (phone && userMessage) {
-      const response = new Response(JSON.stringify({ ok: true }), {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-
-      // Procesar el mensaje DESPUÉS de responder para evitar EarlyDrop
-      (globalThis as any).EdgeRuntime?.waitUntil(processMessage(phone, userMessage));
-
-      return response;
+      await processMessage(phone, userMessage);
     }
 
     return new Response(JSON.stringify({ ok: true }), {
