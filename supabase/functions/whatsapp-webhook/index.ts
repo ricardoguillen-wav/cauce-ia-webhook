@@ -5,8 +5,9 @@ const sb = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const YCLOUD_KEY = Deno.env.get("YCLOUD_API_KEY")!;
-const YCLOUD_URL = "https://api.ycloud.com/v2/whatsapp/messages";
+const YCLOUD_KEY   = Deno.env.get("YCLOUD_API_KEY")!;
+const YCLOUD_PHONE = Deno.env.get("YCLOUD_PHONE")!;
+const YCLOUD_URL   = "https://api.ycloud.com/v2/whatsapp/messages";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -18,7 +19,12 @@ async function sendText(to: string, text: string) {
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
-    body: JSON.stringify({ to, type: "text", text: { body: text } }),
+    body: JSON.stringify({
+      from: YCLOUD_PHONE,
+      to,
+      type: "text",
+      text: { body: text },
+    }),
   });
   console.log("sendText:", res.status, await res.text());
 }
@@ -27,7 +33,12 @@ async function sendImage(to: string, url: string, caption?: string) {
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
-    body: JSON.stringify({ to, type: "image", image: { link: url, caption: caption || "" } }),
+    body: JSON.stringify({
+      from: YCLOUD_PHONE,
+      to,
+      type: "image",
+      image: { link: url, caption: caption || "" },
+    }),
   });
   console.log("sendImage:", res.status, await res.text());
 }
@@ -41,8 +52,14 @@ async function sendButtons(to: string, text: string, options: { label: string; v
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify({
-      to, type: "interactive",
-      interactive: { type: "button", body: { text }, action: { buttons } },
+      from: YCLOUD_PHONE,
+      to,
+      type: "interactive",
+      interactive: {
+        type: "button",
+        body: { text },
+        action: { buttons },
+      },
     }),
   });
   console.log("sendButtons:", res.status, await res.text());
@@ -86,19 +103,19 @@ async function processMessage(phone: string, userMessage: string) {
     if (!flow) { console.log("NO ACTIVE FLOW"); return; }
 
     // Buscar nodo marcado como inicio
-    let { data: firstNode, error: ne } = await sb.from("nodes").select("*")
+    let { data: firstNode } = await sb.from("nodes").select("*")
       .eq("flow_id", flow.id).eq("is_start", true).maybeSingle();
-    console.log("firstNode (is_start):", JSON.stringify(firstNode), "err:", JSON.stringify(ne));
+    console.log("firstNode (is_start):", JSON.stringify(firstNode));
 
-    // Si no hay nodo marcado como inicio, tomar el primero por created_at
+    // Fallback: primer nodo por created_at
     if (!firstNode) {
-      console.log("No is_start node found, falling back to created_at order");
-      const { data: fallbackNode, error: fe2 } = await sb.from("nodes").select("*")
+      console.log("No is_start — usando fallback por created_at");
+      const { data: fallback } = await sb.from("nodes").select("*")
         .eq("flow_id", flow.id).order("created_at", { ascending: true }).limit(1).maybeSingle();
-      console.log("fallbackNode:", JSON.stringify(fallbackNode), "err:", JSON.stringify(fe2));
-      firstNode = fallbackNode;
+      firstNode = fallback;
     }
 
+    console.log("firstNode final:", JSON.stringify(firstNode));
     if (!firstNode) { console.log("NO NODES"); return; }
 
     await sb.from("contacts").upsert(
@@ -116,7 +133,9 @@ async function processMessage(phone: string, userMessage: string) {
   }
 
   console.log("Session found — node:", session.current_node);
-  await sb.from("message_log").insert({ phone, direction: "in", content: userMessage, node_key: session.current_node });
+  await sb.from("message_log").insert({
+    phone, direction: "in", content: userMessage, node_key: session.current_node,
+  });
 
   const { data: currentNode } = await sb.from("nodes").select("*")
     .eq("flow_id", session.flow_id).eq("node_key", session.current_node).maybeSingle();
@@ -157,14 +176,20 @@ async function processMessage(phone: string, userMessage: string) {
   console.log("nextNode:", JSON.stringify(nextNode));
   if (!nextNode) { console.log("NEXT NODE NOT FOUND:", edge.to_node); return; }
 
-  await sb.from("sessions").update({ current_node: edge.to_node, updated_at: new Date().toISOString() }).eq("phone", phone);
+  await sb.from("sessions").update({
+    current_node: edge.to_node,
+    updated_at: new Date().toISOString(),
+  }).eq("phone", phone);
 
   const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
   await executeNode(phone, nodeToSend);
 
   if (nextNode.type === "end") {
     await sb.from("sessions").delete().eq("phone", phone);
-    await sb.from("contacts").update({ status: "en_proceso", updated_at: new Date().toISOString() }).eq("phone", phone);
+    await sb.from("contacts").update({
+      status: "en_proceso",
+      updated_at: new Date().toISOString(),
+    }).eq("phone", phone);
   }
 }
 
