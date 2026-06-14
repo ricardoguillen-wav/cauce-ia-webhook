@@ -1,0 +1,240 @@
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const sb = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const YCLOUD_KEY = Deno.env.get("YCLOUD_API_KEY")!;
+const YCLOUD_URL = "https://api.ycloud.com/v2/whatsapp/messages";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+async function sendText(to: string, text: string) {
+  await fetch(YCLOUD_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
+    body: JSON.stringify({ to, type: "text", text: { body: text } }),
+  });
+}
+
+async function sendImage(to: string, url: string, caption?: string) {
+  await fetch(YCLOUD_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
+    body: JSON.stringify({ to, type: "image", image: { link: url, caption: caption || "" } }),
+  });
+}
+
+async function sendButtons(to: string, text: string, options: { label: string; value: string }[]) {
+  const buttons = options.slice(0, 3).map((o) => ({
+    type: "reply",
+    reply: { id: o.value, title: o.label.slice(0, 20) },
+  }));
+  await fetch(YCLOUD_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
+    body: JSON.stringify({
+      to,
+      type: "interactive",
+      interactive: {
+        type: "button",
+        body: { text },
+        action: { buttons },
+      },
+    }),
+  });
+}
+
+async function executeNode(phone: string, node: any) {
+  if (node.media_url) {
+    await sendImage(phone, node.media_url, node.content || "");
+    if (node.options?.length) await sendButtons(phone, "Elige una opción:", node.options);
+    return;
+  }
+  if (node.options?.length) {
+    await sendButtons(phone, node.content || "Elige una opción:", node.options);
+    return;
+  }
+  if (node.content) await sendText(phone, node.content);
+}
+
+async function resolveVariables(text: string, phone: string): Promise<string> {
+  if (!text || !text.includes("{{")) return text;
+  const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
+  if (!contact) return text;
+  const { data: fields } = await sb.from("contact_data").select("field_key, field_value").eq("contact_id", contact.id);
+  let resolved = text;
+  (fields || []).forEach(f => {
+    resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
+  });
+  return resolved;
+}
+
+async function processMessage(phone: string, userMessage: string) {
+  const { data: session } = await sb.from("sessions").select("*").eq("phone", phone).maybeSingle();
+
+  if (!session) {
+    const { data: flow } = await sb.from("flows").select("id").eq("is_active", true).maybeSingle();
+    if (!flow) return;
+
+    const { data: firstNode } = await sb
+      .from("nodes")
+      .select("*")
+      .eq("flow_id", flow.id)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (!firstNode) return;
+
+    await sb.from("contacts").upsert(
+      { phone, flow_id: flow.id, status: "nuevo", updated_at: new Date().toISOString() },
+      { onConflict: "phone" }
+    );
+    await sb.from("sessions").upsert(
+      { phone, flow_id: flow.id, current_node: firstNode.node_key, updated_at: new Date().toISOString() },
+      { onConflict: "phone" }
+    );
+
+    const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone) };
+    await executeNode(phone, nodeToSend);
+    return;
+  }
+
+  await sb.from("message_log").insert({
+    phone, direction: "in", content: userMessage, node_key: session.current_node,
+  });
+
+  const { data: currentNode } = await sb
+    .from("nodes")
+    .select("*")
+    .eq("flow_id", session.flow_id)
+    .eq("node_key", session.current_node)
+    .maybeSingle();
+
+  if (currentNode?.capture_field) {
+    const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
+    if (contact) {
+      await sb.from("contact_data").upsert(
+        { contact_id: contact.id, field_key: currentNode.capture_field, field_value: userMessage.trim() },
+        { onConflict: "contact_id,field_key" }
+      );
+    }
+  }
+
+  let { data: edge } = await sb
+    .from("edges")
+    .select("*")
+    .eq("flow_id", session.flow_id)
+    .eq("from_node", session.current_node)
+    .ilike("condition", userMessage.trim())
+    .maybeSingle();
+
+  if (!edge) {
+    const { data: freeEdge } = await sb
+      .from("edges")
+      .select("*")
+      .eq("flow_id", session.flow_id)
+      .eq("from_node", session.current_node)
+      .is("condition", null)
+      .maybeSingle();
+    edge = freeEdge;
+  }
+
+  if (!edge) {
+    await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.");
+    return;
+  }
+
+  const { data: nextNode } = await sb
+    .from("nodes")
+    .select("*")
+    .eq("flow_id", session.flow_id)
+    .eq("node_key", edge.to_node)
+    .maybeSingle();
+  if (!nextNode) return;
+
+  await sb.from("sessions").update({
+    current_node: edge.to_node,
+    updated_at: new Date().toISOString(),
+  }).eq("phone", phone);
+
+  const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
+  await executeNode(phone, nodeToSend);
+
+  if (nextNode.type === "end") {
+    await sb.from("sessions").delete().eq("phone", phone);
+    await sb.from("contacts").update({
+      status: "en_proceso",
+      updated_at: new Date().toISOString(),
+    }).eq("phone", phone);
+  }
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+  if (req.method === "GET") {
+    return new Response("OK", { status: 200, headers: corsHeaders });
+  }
+
+  try {
+    const body = await req.json();
+    console.log("Webhook body:", JSON.stringify(body));
+
+    let phone = "";
+    let userMessage = "";
+
+    // Formato real de yCloud
+    if (body?.whatsappInboundMessage) {
+      const msg = body.whatsappInboundMessage;
+      phone = msg.from || "";
+      if (msg.type === "text") {
+        userMessage = msg.text?.body || "";
+      } else if (msg.type === "interactive") {
+        userMessage = msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id || "";
+      } else if (msg.type === "button") {
+        userMessage = msg.button?.payload || msg.button?.text || "";
+      }
+    }
+
+    // Formato Meta alternativo
+    if (!phone && body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
+      const msg = body.entry[0].changes[0].value.messages[0];
+      phone = msg.from || "";
+      userMessage = msg.text?.body || msg.interactive?.button_reply?.id || "";
+    }
+
+    // Formato legacy yCloud
+    if (!phone && body?.message) {
+      const msg = body.message;
+      phone = msg.from || "";
+      if (msg.type === "text") userMessage = msg.text?.body || "";
+      else if (msg.type === "interactive") userMessage = msg.interactive?.button_reply?.id || "";
+      else if (msg.type === "button") userMessage = msg.button?.payload || "";
+    }
+
+    console.log("Parsed — phone:", phone, "message:", userMessage);
+
+    if (phone && userMessage) {
+      await processMessage(phone, userMessage);
+    }
+
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+
+  } catch (err) {
+    console.error("Error:", err);
+    return new Response(JSON.stringify({ error: String(err) }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+});
