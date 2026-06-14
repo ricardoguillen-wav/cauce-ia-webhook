@@ -9,6 +9,9 @@ const YCLOUD_KEY  = Deno.env.get("YCLOUD_API_KEY")!;
 const YCLOUD_FROM = "+526181239810";
 const YCLOUD_URL  = "https://api.ycloud.com/v2/whatsapp/messages";
 
+console.log("INIT — YCLOUD_FROM:", YCLOUD_FROM);
+console.log("INIT — YCLOUD_KEY length:", YCLOUD_KEY?.length);
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -17,24 +20,24 @@ const corsHeaders = {
 
 async function sendText(to: string, text: string) {
   const payload = { from: YCLOUD_FROM, to, type: "text", text: { body: text } };
-  console.log("sendText payload:", JSON.stringify(payload));
+  console.log("sendText payload JSON:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify(payload),
   });
-  console.log("sendText:", res.status, await res.text());
+  console.log("sendText response:", res.status, await res.text());
 }
 
 async function sendImage(to: string, url: string, caption?: string) {
   const payload = { from: YCLOUD_FROM, to, type: "image", image: { link: url, caption: caption || "" } };
-  console.log("sendImage payload:", JSON.stringify(payload));
+  console.log("sendImage payload JSON:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify(payload),
   });
-  console.log("sendImage:", res.status, await res.text());
+  console.log("sendImage response:", res.status, await res.text());
 }
 
 async function sendButtons(to: string, text: string, options: { label: string; value: string }[]) {
@@ -48,13 +51,13 @@ async function sendButtons(to: string, text: string, options: { label: string; v
     type: "interactive",
     interactive: { type: "button", body: { text }, action: { buttons } },
   };
-  console.log("sendButtons payload:", JSON.stringify(payload));
+  console.log("sendButtons payload JSON:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
     body: JSON.stringify(payload),
   });
-  console.log("sendButtons:", res.status, await res.text());
+  console.log("sendButtons response:", res.status, await res.text());
 }
 
 async function executeNode(phone: string, node: any) {
