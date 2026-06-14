@@ -85,9 +85,20 @@ async function processMessage(phone: string, userMessage: string) {
     console.log("flow:", JSON.stringify(flow), "err:", JSON.stringify(fe));
     if (!flow) { console.log("NO ACTIVE FLOW"); return; }
 
-    const { data: firstNode, error: ne } = await sb.from("nodes").select("*")
-      .eq("flow_id", flow.id).order("created_at", { ascending: true }).limit(1).maybeSingle();
-    console.log("firstNode:", JSON.stringify(firstNode), "err:", JSON.stringify(ne));
+    // Buscar nodo marcado como inicio
+    let { data: firstNode, error: ne } = await sb.from("nodes").select("*")
+      .eq("flow_id", flow.id).eq("is_start", true).maybeSingle();
+    console.log("firstNode (is_start):", JSON.stringify(firstNode), "err:", JSON.stringify(ne));
+
+    // Si no hay nodo marcado como inicio, tomar el primero por created_at
+    if (!firstNode) {
+      console.log("No is_start node found, falling back to created_at order");
+      const { data: fallbackNode, error: fe2 } = await sb.from("nodes").select("*")
+        .eq("flow_id", flow.id).order("created_at", { ascending: true }).limit(1).maybeSingle();
+      console.log("fallbackNode:", JSON.stringify(fallbackNode), "err:", JSON.stringify(fe2));
+      firstNode = fallbackNode;
+    }
+
     if (!firstNode) { console.log("NO NODES"); return; }
 
     await sb.from("contacts").upsert(
