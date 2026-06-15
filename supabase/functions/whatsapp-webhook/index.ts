@@ -5,9 +5,8 @@ const sb = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const YCLOUD_KEY  = Deno.env.get("YCLOUD_API_KEY")!;
-const YCLOUD_FROM = "+526181239810";
-const YCLOUD_URL  = "https://api.ycloud.com/v2/whatsapp/messages";
+const YCLOUD_KEY = Deno.env.get("YCLOUD_API_KEY")!;
+const YCLOUD_URL = "https://api.ycloud.com/v2/whatsapp/messages";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -15,8 +14,14 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
-async function sendText(to: string, text: string) {
-  const payload = { from: YCLOUD_FROM, to, type: "text", text: { body: text } };
+// Obtener el número de WhatsApp del flujo activo
+async function getFromPhone(flowId: string): Promise<string> {
+  const { data } = await sb.from("flows").select("whatsapp_phone").eq("id", flowId).maybeSingle();
+  return data?.whatsapp_phone || "+526181239810";
+}
+
+async function sendText(to: string, text: string, from: string) {
+  const payload = { from, to, type: "text", text: { body: text } };
   console.log("sendText payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
@@ -26,8 +31,8 @@ async function sendText(to: string, text: string) {
   console.log("sendText response:", res.status, await res.text());
 }
 
-async function sendImage(to: string, url: string, caption?: string) {
-  const payload: any = { from: YCLOUD_FROM, to, type: "image", image: { link: url } };
+async function sendImage(to: string, url: string, from: string, caption?: string) {
+  const payload: any = { from, to, type: "image", image: { link: url } };
   if (caption) payload.image.caption = caption;
   console.log("sendImage payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
@@ -38,13 +43,13 @@ async function sendImage(to: string, url: string, caption?: string) {
   console.log("sendImage response:", res.status, await res.text());
 }
 
-async function sendButtons(to: string, text: string, options: { label: string; value: string }[]) {
+async function sendButtons(to: string, text: string, options: { label: string; value: string }[], from: string) {
   const buttons = options.slice(0, 3).map((o) => ({
     type: "reply",
     reply: { id: o.value, title: o.label.slice(0, 20) },
   }));
   const payload = {
-    from: YCLOUD_FROM, to, type: "interactive",
+    from, to, type: "interactive",
     interactive: { type: "button", body: { text }, action: { buttons } },
   };
   console.log("sendButtons payload:", JSON.stringify(payload));
@@ -56,19 +61,32 @@ async function sendButtons(to: string, text: string, options: { label: string; v
   console.log("sendButtons response:", res.status, await res.text());
 }
 
-async function resolveVariables(text: string, phone: string): Promise<string> {
-  if (!text || !text.includes("{{")) return text;
-  const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
-  if (!contact) return text;
-  const { data: fields } = await sb.from("contact_data").select("field_key, field_value").eq("contact_id", contact.id);
-  let resolved = text;
-  (fields || []).forEach((f: any) => {
-    resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
-  });
-  return resolved;
+async function executeNode(phone: string, node: any, from: string, autoAdvance = true) {
+  console.log("executeNode:", node.node_key, "type:", node.type);
+
+  if (node.media_url) {
+    await sendImage(phone, node.media_url, from, node.content || "");
+    if (node.options?.length) {
+      await sendButtons(phone, "Elige una opción:", node.options, from);
+    } else if (autoAdvance) {
+      await autoAdvanceNode(phone, node, from);
+    }
+    return;
+  }
+
+  if (node.options?.length) {
+    await sendButtons(phone, node.content || "Elige una opción:", node.options, from);
+    return;
+  }
+
+  if (node.content) await sendText(phone, node.content, from);
+
+  if (node.type === "message" && autoAdvance) {
+    await autoAdvanceNode(phone, node, from);
+  }
 }
 
-async function autoAdvanceNode(phone: string, node: any) {
+async function autoAdvanceNode(phone: string, node: any, from: string) {
   console.log("autoAdvance desde:", node.node_key);
 
   const { data: session } = await sb.from("sessions").select("flow_id").eq("phone", phone).maybeSingle();
@@ -95,7 +113,7 @@ async function autoAdvanceNode(phone: string, node: any) {
   }).eq("phone", phone);
 
   const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
-  await executeNode(phone, nodeToSend);
+  await executeNode(phone, nodeToSend, from);
 
   if (nextNode.type === "end") {
     await sb.from("sessions").delete().eq("phone", phone);
@@ -106,41 +124,43 @@ async function autoAdvanceNode(phone: string, node: any) {
   }
 }
 
-async function executeNode(phone: string, node: any, autoAdvance = true) {
-  console.log("executeNode:", node.node_key, "type:", node.type);
-
-  if (node.media_url) {
-    await sendImage(phone, node.media_url, node.content || "");
-    if (node.options?.length) {
-      await sendButtons(phone, "Elige una opción:", node.options);
-    } else if (autoAdvance) {
-      await autoAdvanceNode(phone, node);
-    }
-    return;
-  }
-
-  if (node.options?.length) {
-    await sendButtons(phone, node.content || "Elige una opción:", node.options);
-    return;
-  }
-
-  if (node.content) await sendText(phone, node.content);
-
-  if (node.type === "message" && autoAdvance) {
-    await autoAdvanceNode(phone, node);
-  }
+async function resolveVariables(text: string, phone: string): Promise<string> {
+  if (!text || !text.includes("{{")) return text;
+  const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
+  if (!contact) return text;
+  const { data: fields } = await sb.from("contact_data").select("field_key, field_value").eq("contact_id", contact.id);
+  let resolved = text;
+  (fields || []).forEach((f: any) => {
+    resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
+  });
+  return resolved;
 }
 
-async function processMessage(phone: string, userMessage: string) {
-  console.log("processMessage — phone:", phone, "msg:", userMessage);
+async function processMessage(phone: string, userMessage: string, toPhone: string) {
+  console.log("processMessage — phone:", phone, "msg:", userMessage, "to:", toPhone);
 
   const { data: session, error: se } = await sb.from("sessions").select("*").eq("phone", phone).maybeSingle();
   console.log("session:", JSON.stringify(session), "err:", JSON.stringify(se));
 
   if (!session) {
-    const { data: flow, error: fe } = await sb.from("flows").select("id").eq("is_active", true).maybeSingle();
-    console.log("flow:", JSON.stringify(flow), "err:", JSON.stringify(fe));
+    // Buscar flujo activo que coincida con el número receptor
+    let { data: flow } = await sb.from("flows").select("id, whatsapp_phone")
+      .eq("is_active", true)
+      .eq("whatsapp_phone", toPhone)
+      .maybeSingle();
+
+    // Si no encuentra por número, buscar cualquier flujo activo
+    if (!flow) {
+      const { data: anyFlow } = await sb.from("flows").select("id, whatsapp_phone")
+        .eq("is_active", true)
+        .maybeSingle();
+      flow = anyFlow;
+    }
+
+    console.log("flow:", JSON.stringify(flow));
     if (!flow) { console.log("NO ACTIVE FLOW"); return; }
+
+    const from = await getFromPhone(flow.id);
 
     let { data: firstNode } = await sb.from("nodes").select("*")
       .eq("flow_id", flow.id).eq("is_start", true).maybeSingle();
@@ -166,9 +186,11 @@ async function processMessage(phone: string, userMessage: string) {
     );
 
     const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone) };
-    await executeNode(phone, nodeToSend);
+    await executeNode(phone, nodeToSend, from);
     return;
   }
+
+  const from = await getFromPhone(session.flow_id);
 
   console.log("Session found — node:", session.current_node);
   await sb.from("message_log").insert({
@@ -205,7 +227,7 @@ async function processMessage(phone: string, userMessage: string) {
 
   if (!edge) {
     console.log("NO EDGE FOUND");
-    await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.");
+    await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.", from);
     return;
   }
 
@@ -220,7 +242,7 @@ async function processMessage(phone: string, userMessage: string) {
   }).eq("phone", phone);
 
   const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
-  await executeNode(phone, nodeToSend);
+  await executeNode(phone, nodeToSend, from);
 
   if (nextNode.type === "end") {
     await sb.from("sessions").delete().eq("phone", phone);
@@ -245,10 +267,12 @@ Deno.serve(async (req) => {
 
     let phone = "";
     let userMessage = "";
+    let toPhone = "";
 
     if (body?.whatsappInboundMessage) {
       const msg = body.whatsappInboundMessage;
-      phone = msg.from || "";
+      phone   = msg.from || "";
+      toPhone = msg.to   || "";
       if (msg.type === "text") userMessage = msg.text?.body || "";
       else if (msg.type === "interactive") userMessage = msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id || "";
       else if (msg.type === "button") userMessage = msg.button?.payload || msg.button?.text || "";
@@ -256,22 +280,24 @@ Deno.serve(async (req) => {
 
     if (!phone && body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
       const msg = body.entry[0].changes[0].value.messages[0];
-      phone = msg.from || "";
+      phone   = msg.from || "";
+      toPhone = msg.to   || "";
       userMessage = msg.text?.body || msg.interactive?.button_reply?.id || "";
     }
 
     if (!phone && body?.message) {
       const msg = body.message;
-      phone = msg.from || "";
+      phone   = msg.from || "";
+      toPhone = msg.to   || "";
       if (msg.type === "text") userMessage = msg.text?.body || "";
       else if (msg.type === "interactive") userMessage = msg.interactive?.button_reply?.id || "";
       else if (msg.type === "button") userMessage = msg.button?.payload || "";
     }
 
-    console.log("Parsed — phone:", phone, "msg:", userMessage);
+    console.log("Parsed — phone:", phone, "to:", toPhone, "msg:", userMessage);
 
     if (phone && userMessage) {
-      await processMessage(phone, userMessage);
+      await processMessage(phone, userMessage, toPhone);
     }
 
     return new Response(JSON.stringify({ ok: true }), {
