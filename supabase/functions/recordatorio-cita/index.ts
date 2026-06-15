@@ -5,8 +5,8 @@ const sb = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const YCLOUD_KEY = Deno.env.get("YCLOUD_API_KEY")!;
-const YCLOUD_URL = "https://api.ycloud.com/v2/whatsapp/messages";
+const YCLOUD_KEY   = Deno.env.get("YCLOUD_API_KEY")!;
+const YCLOUD_URL   = "https://api.ycloud.com/v2/whatsapp/messages";
 const DEEPSEEK_KEY = Deno.env.get("DEEPSEEK_API_KEY")!;
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 
@@ -16,13 +16,11 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
-// ── Obtener número de WA del flujo ──
 async function getFromPhone(flowId: string): Promise<string> {
   const { data } = await sb.from("flows").select("whatsapp_phone").eq("id", flowId).maybeSingle();
   return data?.whatsapp_phone || "+526181239810";
 }
 
-// ── Enviar mensaje de texto ──
 async function sendText(to: string, text: string, from: string) {
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
@@ -32,40 +30,23 @@ async function sendText(to: string, text: string, from: string) {
   console.log("sendText:", res.status, await res.text());
 }
 
-// ── Interpretar fecha con DeepSeek ──
 async function interpretarFecha(disponibilidad: string): Promise<string | null> {
   if (!disponibilidad) return null;
-
   const hoy = new Date();
-  const prompt = `Hoy es ${hoy.toLocaleDateString('es-MX', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}.
-
-El candidato escribió esto como disponibilidad para su cita: "${disponibilidad}"
-
-Extrae la fecha exacta de la cita. Responde SOLO con la fecha en formato ISO YYYY-MM-DD.
-Si no puedes determinar una fecha exacta, responde "null".
-Ejemplos:
-- "martes 17 de junio a las 10am" → "2026-06-17"
-- "mañana a las 3pm" → "${new Date(Date.now()+86400000).toISOString().slice(0,10)}"
-- "la próxima semana" → "null"
-- "jueves" → la fecha del próximo jueves en formato ISO`;
+  const prompt = `Hoy es ${hoy.toLocaleDateString('es-MX', { weekday:'long', year:'numeric', month:'long', day:'numeric' })}.
+El candidato escribió su disponibilidad: "${disponibilidad}"
+Extrae la fecha exacta en formato ISO YYYY-MM-DD. Si no puedes determinar fecha exacta responde "null".
+Responde SOLO con la fecha o "null", sin explicaciones.`;
 
   try {
     const res = await fetch(DEEPSEEK_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${DEEPSEEK_KEY}`
-      },
-      body: JSON.stringify({
-        model: "deepseek-chat",
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: 20,
-        temperature: 0
-      })
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${DEEPSEEK_KEY}` },
+      body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "user", content: prompt }], max_tokens: 20, temperature: 0 })
     });
     const data = await res.json();
     const fecha = data?.choices?.[0]?.message?.content?.trim();
-    console.log(`Fecha interpretada: "${disponibilidad}" → "${fecha}"`);
+    console.log(`Fecha: "${disponibilidad}" → "${fecha}"`);
     return fecha === "null" ? null : fecha;
   } catch(e) {
     console.error("DeepSeek error:", e);
@@ -74,37 +55,39 @@ Ejemplos:
 }
 
 // ── Procesar recordatorios ──
-async function procesarRecordatorios() {
-  console.log("Iniciando proceso de recordatorios...");
+// tipo: "noche" = aviso la noche anterior (cita es mañana)
+//       "manana" = recordatorio mañana mismo (cita es hoy)
+async function procesarRecordatorios(tipo: "noche" | "manana") {
+  console.log(`Procesando recordatorios tipo=${tipo}...`, new Date().toISOString());
 
-  // Obtener todos los contactos en estado "nuevo" o "en_proceso"
-  // que tengan campo "disponibilidad" capturado
-  const { data: contactDataRows, error } = await sb
+  const { data: rows, error } = await sb
     .from("contact_data")
     .select("contact_id, field_value")
     .eq("field_key", "disponibilidad");
 
-  if (error) { console.error("Error obteniendo contact_data:", error); return; }
-  if (!contactDataRows?.length) { console.log("Sin contactos con disponibilidad"); return; }
+  if (error || !rows?.length) {
+    console.log("Sin datos:", error);
+    return { revisados: 0, enviados: 0 };
+  }
 
-  console.log(`${contactDataRows.length} contactos con disponibilidad registrada`);
+  // Fecha objetivo según tipo
+  // "noche"  → la cita es mañana (buscamos fecha = hoy + 1 día en hora Monterrey)
+  // "manana" → la cita es hoy    (buscamos fecha = hoy en hora Monterrey)
+  const ahora = new Date();
+  // Convertir a hora Monterrey (UTC-6)
+  const monterrey = new Date(ahora.getTime() - 6 * 3600000);
+  const objetivo  = new Date(monterrey);
+  if (tipo === "noche") objetivo.setDate(objetivo.getDate() + 1);
+  const objetivoISO = objetivo.toISOString().slice(0, 10);
 
-  const manana = new Date();
-  manana.setDate(manana.getDate() + 1);
-  const mananaISO = manana.toISOString().slice(0, 10);
-  console.log("Buscando citas para mañana:", mananaISO);
+  console.log(`Buscando citas para: ${objetivoISO} (tipo: ${tipo}) — ${rows.length} registros a revisar`);
 
   let enviados = 0;
-  let revisados = 0;
 
-  for (const row of contactDataRows) {
-    revisados++;
-
-    // Interpretar la fecha con DeepSeek
+  for (const row of rows) {
     const fechaCita = await interpretarFecha(row.field_value);
-    if (!fechaCita || fechaCita !== mananaISO) continue;
+    if (!fechaCita || fechaCita !== objetivoISO) continue;
 
-    // Obtener datos del contacto
     const { data: contact } = await sb
       .from("contacts")
       .select("*, contact_data(*)")
@@ -112,87 +95,114 @@ async function procesarRecordatorios() {
       .maybeSingle();
 
     if (!contact) continue;
-    if (contact.status === "contratado" || contact.status === "rechazado" || contact.status === "descartado") continue;
+    if (['contratado','rechazado','descartado'].includes(contact.status)) continue;
     if (contact.bot_paused) continue;
 
-    // Armar datos del contacto
     const datos: Record<string, string> = {};
     (contact.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
 
-    const nombre   = datos.nombre   || "Candidato";
-    const empresa  = datos.empresa  || "la empresa";
-    const puesto   = datos.puesto   || "el puesto";
-    const horaCita = row.field_value;
+    const nombre  = datos.nombre  || "Candidato";
+    const empresa = datos.empresa || "la empresa";
+    const puesto  = datos.puesto  || "el puesto";
+    const from    = await getFromPhone(contact.flow_id);
 
-    // Obtener número de WA del flujo
-    const from = await getFromPhone(contact.flow_id);
+    // Mensaje diferente según el tipo
+    const mensaje = tipo === "noche"
+      ? `¡Buenas noches ${nombre}! 🌙
 
-    // Enviar recordatorio
-    const mensaje = `¡Hola ${nombre}! 👋
+Te recordamos que *mañana* tienes tu entrevista de trabajo con *Cauce Talento*.
 
-Te recordamos que *mañana* tienes tu entrevista para el puesto de *${puesto}* en *${empresa}*.
+💼 Puesto: *${puesto}*
+🏢 Empresa: *${empresa}*
+📅 Hora acordada: ${row.field_value}
 
-📅 Fecha y hora acordada: ${horaCita}
+Prepara tu documentación y llega 10 minutos antes. Si necesitas hacer algún cambio, responde este mensaje esta noche.
 
-Por favor llega 10 minutos antes. Si necesitas reagendar, responde este mensaje y con gusto te ayudamos.
+¡Descansa bien y mucho éxito mañana! 💪
+— Equipo Cauce Talento`
+      : `¡Buenos días ${nombre}! ☀️
 
-¡Mucho éxito! 🌟
+Este es tu recordatorio de que *hoy* tienes tu entrevista de trabajo.
+
+💼 Puesto: *${puesto}*
+🏢 Empresa: *${empresa}*
+📅 Hora: ${row.field_value}
+
+Recuerda llegar 10 minutos antes. ¡Ya casi! 🚀
 — Equipo Cauce Talento`;
 
     await sendText(contact.phone, mensaje, from);
-
-    // Registrar en message_log
     await sb.from("message_log").insert({
       phone: contact.phone,
       direction: "out",
       content: mensaje,
-      node_key: "recordatorio_automatico"
+      node_key: `recordatorio_${tipo}`
     });
 
-    console.log(`Recordatorio enviado a ${contact.phone} (${nombre}) — cita: ${horaCita}`);
+    console.log(`Recordatorio ${tipo} enviado → ${contact.phone} (${nombre}) cita: ${row.field_value}`);
     enviados++;
-
-    // Pequeña pausa entre envíos para no saturar la API
     await new Promise(r => setTimeout(r, 500));
   }
 
-  console.log(`Proceso completado: ${enviados} recordatorios enviados de ${revisados} revisados`);
-  return { revisados, enviados };
+  console.log(`Completado: ${enviados} recordatorios enviados`);
+  return { revisados: rows.length, enviados };
 }
 
-// ── Handler ──
+// ============================================================
+// CRONS
+// ============================================================
+
+// Recordatorio noche anterior — 23:00 Monterrey = 05:00 UTC
+Deno.cron("recordatorio-noche", "0 5 * * *", async () => {
+  console.log("CRON noche ejecutándose...");
+  await procesarRecordatorios("noche");
+});
+
+// Recordatorio mañana del día de la cita — 8:00 Monterrey = 14:00 UTC
+Deno.cron("recordatorio-manana", "0 14 * * *", async () => {
+  console.log("CRON mañana ejecutándose...");
+  await procesarRecordatorios("manana");
+});
+
+// ============================================================
+// HTTP — ejecutar manualmente desde el CRM
+// ============================================================
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  // Verificar autorización para llamadas manuales
-  // El cron de Deno Deploy llama sin body, las llamadas manuales pueden incluir un token
-  const authHeader = req.headers.get("Authorization");
-  const cronSecret = Deno.env.get("CRON_SECRET");
+  if (req.method === "GET") {
+    return new Response(JSON.stringify({
+      ok: true,
+      message: "Servicio de recordatorios activo",
+      crons: [
+        { nombre: "Recordatorio noche", hora: "23:00 Monterrey", utc: "05:00 UTC" },
+        { nombre: "Recordatorio mañana", hora: "08:00 Monterrey", utc: "14:00 UTC" }
+      ]
+    }), {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json" }
+    });
+  }
 
-  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
-    // Verificar si es llamada del cron interno de Deno (sin auth header)
-    const isDenoCron = req.headers.get("x-deno-cron") === "true";
-    if (!isDenoCron) {
-      return new Response(JSON.stringify({ error: "No autorizado" }), {
-        status: 401,
+  if (req.method === "POST") {
+    try {
+      const body = await req.json().catch(() => ({}));
+      const tipo = body?.tipo === "manana" ? "manana" : "noche";
+      const resultado = await procesarRecordatorios(tipo);
+      return new Response(JSON.stringify({ ok: true, tipo, ...resultado }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    } catch(err) {
+      console.error("Error:", err);
+      return new Response(JSON.stringify({ error: String(err) }), {
+        status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" }
       });
     }
   }
 
-  try {
-    const resultado = await procesarRecordatorios();
-    return new Response(JSON.stringify({ ok: true, ...resultado }), {
-      status: 200,
-      headers: { ...corsHeaders, "Content-Type": "application/json" }
-    });
-  } catch(err) {
-    console.error("Error:", err);
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" }
-    });
-  }
+  return new Response("Method not allowed", { status: 405 });
 });
