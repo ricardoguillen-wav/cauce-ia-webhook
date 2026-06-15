@@ -20,16 +20,15 @@ const corsHeaders = {
 // DEEPSEEK — Normalizar valor capturado
 // ============================================================
 async function normalizeField(fieldKey: string, rawValue: string): Promise<string> {
-  // Solo normalizar campos que lo necesitan
   const fieldsToNormalize = ['ciudad', 'municipio', 'puesto', 'nombre', 'experiencia'];
   if (!fieldsToNormalize.includes(fieldKey.toLowerCase())) return rawValue;
 
   const prompts: Record<string, string> = {
-    ciudad:      `El usuario respondió sobre su ciudad o municipio: "${rawValue}". Extrae SOLO el nombre del municipio o ciudad en formato título (primera letra mayúscula). Si mencionan colonia o estado, ignóralos. Solo el municipio. Ejemplos: "vivo en apodaca nl" → "Apodaca", "soy de san pedro" → "San Pedro Garza García", "guadalupe" → "Guadalupe". Responde SOLO con el nombre, sin explicaciones.`,
+    ciudad:      `El usuario respondió sobre su ciudad o municipio: "${rawValue}". Extrae SOLO el nombre del municipio en formato título. Si mencionan colonia o estado, ignóralos. Ejemplos: "vivo en apodaca nl" → "Apodaca", "soy de san pedro" → "San Pedro Garza García". Responde SOLO con el nombre, sin explicaciones.`,
     municipio:   `El usuario respondió sobre su municipio: "${rawValue}". Extrae SOLO el nombre del municipio en formato título. Responde SOLO con el nombre.`,
-    puesto:      `El usuario respondió sobre el puesto que busca: "${rawValue}". Normaliza a un nombre de puesto profesional y conciso. Ejemplos: "quiero ser montacarguista" → "Montacarguista", "operador de maquinaria" → "Operador", "manejo montacargas" → "Montacarguista". Responde SOLO con el nombre del puesto.`,
-    nombre:      `El usuario respondió con su nombre: "${rawValue}". Extrae SOLO el nombre completo en formato título (primera letra mayúscula en cada palabra). Ignora frases como "me llamo" o "soy". Responde SOLO con el nombre.`,
-    experiencia: `El usuario respondió sobre sus años de experiencia: "${rawValue}". Extrae SOLO el número de años. Ejemplos: "tengo 3 años" → "3", "cinco años" → "5", "2" → "2". Responde SOLO con el número.`,
+    puesto:      `El usuario respondió sobre el puesto que busca: "${rawValue}". Normaliza a un nombre de puesto profesional y conciso. Ejemplos: "quiero ser montacarguista" → "Montacarguista", "manejo montacargas" → "Montacarguista". Responde SOLO con el nombre del puesto.`,
+    nombre:      `El usuario respondió con su nombre: "${rawValue}". Extrae SOLO el nombre completo en formato título. Ignora frases como "me llamo" o "soy". Responde SOLO con el nombre.`,
+    experiencia: `El usuario respondió sobre sus años de experiencia: "${rawValue}". Extrae SOLO el número de años. Ejemplos: "tengo 3 años" → "3", "cinco años" → "5". Responde SOLO con el número.`,
   };
 
   const prompt = prompts[fieldKey.toLowerCase()];
@@ -55,7 +54,7 @@ async function normalizeField(fieldKey: string, rawValue: string): Promise<strin
     return normalized || rawValue;
   } catch(e) {
     console.error('DeepSeek error:', e);
-    return rawValue; // Si falla, usar valor original
+    return rawValue;
   }
 }
 
@@ -131,13 +130,18 @@ async function autoAdvanceNode(phone: string, node: any, from: string) {
     .eq("flow_id", session.flow_id).eq("node_key", edge.to_node).maybeSingle();
   if (!nextNode) return;
 
-  await sb.from("sessions").update({ current_node: edge.to_node, updated_at: new Date().toISOString() }).eq("phone", phone);
+  await sb.from("sessions").update({
+    current_node: edge.to_node, updated_at: new Date().toISOString()
+  }).eq("phone", phone);
+
   const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
   await executeNode(phone, nodeToSend, from);
 
   if (nextNode.type === "end") {
     await sb.from("sessions").delete().eq("phone", phone);
-    await sb.from("contacts").update({ status: "en_proceso", updated_at: new Date().toISOString() }).eq("phone", phone);
+    await sb.from("contacts").update({
+      status: "en_proceso", updated_at: new Date().toISOString()
+    }).eq("phone", phone);
   }
 }
 
@@ -171,6 +175,14 @@ async function executeNode(phone: string, node: any, from: string, autoAdvance =
 // ============================================================
 async function processMessage(phone: string, userMessage: string, toPhone: string) {
   console.log("processMessage — phone:", phone, "msg:", userMessage, "to:", toPhone);
+
+  // ── Verificar si el bot está pausado para este contacto ──
+  const { data: contactCheck } = await sb.from("contacts")
+    .select("bot_paused").eq("phone", phone).maybeSingle();
+  if (contactCheck?.bot_paused) {
+    console.log("Bot pausado para:", phone, "— ignorando mensaje");
+    return;
+  }
 
   const { data: session, error: se } = await sb.from("sessions").select("*").eq("phone", phone).maybeSingle();
   console.log("session:", JSON.stringify(session), "err:", JSON.stringify(se));
@@ -230,9 +242,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   if (currentNode?.capture_field) {
     const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
     if (contact) {
-      // Normalizar el valor con DeepSeek
       const normalizedValue = await normalizeField(currentNode.capture_field, userMessage.trim());
-
       await sb.from("contact_data").upsert(
         { contact_id: contact.id, field_key: currentNode.capture_field, field_value: normalizedValue },
         { onConflict: "contact_id,field_key" }
