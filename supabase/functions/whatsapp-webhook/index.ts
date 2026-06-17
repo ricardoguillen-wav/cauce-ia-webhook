@@ -174,6 +174,21 @@ async function sendList(to: string, body: string, buttonText: string, sectionTit
 async function executeNode(phone: string, node: any, from: string, autoAdvance = true) {
   console.log("executeNode:", node.node_key, "type:", node.type);
 
+  if (node.media_urls?.length > 1) {
+    // Enviar múltiples imágenes en secuencia
+    for (let i = 0; i < node.media_urls.length; i++) {
+      const caption = i === 0 ? (node.content || "") : "";
+      await sendImage(phone, node.media_urls[i], from, caption);
+      if (i < node.media_urls.length - 1) await new Promise(r => setTimeout(r, 800));
+    }
+    if (node.options?.length) {
+      await sendButtons(phone, "Elige una opción:", node.options, from);
+    } else if (autoAdvance) {
+      await autoAdvanceNode(phone, node, from);
+    }
+    return;
+  }
+
   if (node.media_url) {
     await sendImage(phone, node.media_url, from, node.content || "");
     if (node.options?.length) {
