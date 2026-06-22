@@ -5,7 +5,8 @@ const sb = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const YCLOUD_KEY   = Deno.env.get("YCLOUD_API_KEY")!;
+// Variable de respaldo — se usa SOLO si un flujo no tiene su propia API key configurada
+const YCLOUD_KEY_FALLBACK = Deno.env.get("YCLOUD_API_KEY") || "";
 const YCLOUD_URL   = "https://api.ycloud.com/v2/whatsapp/messages";
 const DEEPSEEK_KEY = Deno.env.get("DEEPSEEK_API_KEY")!;
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
@@ -20,7 +21,6 @@ const corsHeaders = {
 // DEEPSEEK — Normalizar valor capturado
 // ============================================================
 async function normalizeField(fieldKey: string, rawValue: string): Promise<string> {
-  // Solo normalizar campos que lo necesitan
   const fieldsToNormalize = ['ciudad', 'municipio', 'puesto', 'nombre', 'experiencia'];
   if (!fieldsToNormalize.includes(fieldKey.toLowerCase())) return rawValue;
 
@@ -55,41 +55,53 @@ async function normalizeField(fieldKey: string, rawValue: string): Promise<strin
     return normalized || rawValue;
   } catch(e) {
     console.error('DeepSeek error:', e);
-    return rawValue; // Si falla, usar valor original
+    return rawValue;
   }
 }
 
 // ============================================================
-// YCLOUD — Envío de mensajes
+// CONFIGURACIÓN DEL FLUJO — número + API key propios
 // ============================================================
-async function getFromPhone(flowId: string): Promise<string> {
-  const { data } = await sb.from("flows").select("whatsapp_phone").eq("id", flowId).maybeSingle();
-  return data?.whatsapp_phone || "+526181239810";
+type FlowConfig = { from: string; apiKey: string };
+
+async function getFlowConfig(flowId: string): Promise<FlowConfig> {
+  const { data } = await sb.from("flows")
+    .select("whatsapp_phone, ycloud_api_key")
+    .eq("id", flowId)
+    .maybeSingle();
+
+  return {
+    from: data?.whatsapp_phone || "+526181239810",
+    apiKey: data?.ycloud_api_key || YCLOUD_KEY_FALLBACK,
+  };
 }
 
-async function sendText(to: string, text: string, from: string) {
+// ============================================================
+// YCLOUD — Envío de mensajes (cada llamada usa la API key de SU flujo)
+// ============================================================
+async function sendText(to: string, text: string, from: string, apiKey: string) {
   const payload = { from, to, type: "text", text: { body: text } };
   console.log("sendText payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
+    headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify(payload),
   });
   console.log("sendText response:", res.status, await res.text());
 }
 
-async function sendImage(to: string, url: string, from: string, caption?: string) {
+async function sendImage(to: string, url: string, from: string, apiKey: string, caption?: string) {
   const payload: any = { from, to, type: "image", image: { link: url } };
   if (caption) payload.image.caption = caption;
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
+    headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify(payload),
   });
   console.log("sendImage response:", res.status, await res.text());
 }
 
-async function sendButtons(to: string, text: string, options: { label: string; value: string }[], from: string) {
+async function sendButtons(to: string, text: string, options: { label: string; value: string }[], from: string, apiKey: string) {
   const buttons = options.slice(0, 3).map((o) => ({
     type: "reply",
     reply: { id: o.value, title: o.label.slice(0, 20) },
@@ -100,48 +112,13 @@ async function sendButtons(to: string, text: string, options: { label: string; v
   };
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
+    headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify(payload),
   });
   console.log("sendButtons response:", res.status, await res.text());
 }
 
-async function resolveVariables(text: string, phone: string): Promise<string> {
-  if (!text || !text.includes("{{")) return text;
-  const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
-  if (!contact) return text;
-  const { data: fields } = await sb.from("contact_data").select("field_key, field_value").eq("contact_id", contact.id);
-  let resolved = text;
-  (fields || []).forEach((f: any) => {
-    resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
-  });
-  return resolved;
-}
-
-async function autoAdvanceNode(phone: string, node: any, from: string) {
-  console.log("autoAdvance desde:", node.node_key);
-  const { data: session } = await sb.from("sessions").select("flow_id").eq("phone", phone).maybeSingle();
-  if (!session) return;
-
-  const { data: edge } = await sb.from("edges").select("*")
-    .eq("flow_id", session.flow_id).eq("from_node", node.node_key).is("condition", null).maybeSingle();
-  if (!edge) return;
-
-  const { data: nextNode } = await sb.from("nodes").select("*")
-    .eq("flow_id", session.flow_id).eq("node_key", edge.to_node).maybeSingle();
-  if (!nextNode) return;
-
-  await sb.from("sessions").update({ current_node: edge.to_node, updated_at: new Date().toISOString() }).eq("phone", phone);
-  const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
-  await executeNode(phone, nodeToSend, from);
-
-  if (nextNode.type === "end") {
-    await sb.from("sessions").delete().eq("phone", phone);
-    await sb.from("contacts").update({ status: "en_proceso", updated_at: new Date().toISOString() }).eq("phone", phone);
-  }
-}
-
-async function sendList(to: string, body: string, buttonText: string, sectionTitle: string, items: { label: string; value: string; description?: string }[], from: string) {
+async function sendList(to: string, body: string, buttonText: string, sectionTitle: string, items: { label: string; value: string; description?: string }[], from: string, apiKey: string) {
   const rows = items.map(item => ({
     id: item.value,
     title: item.label.slice(0, 24),
@@ -165,36 +142,71 @@ async function sendList(to: string, body: string, buttonText: string, sectionTit
   console.log("sendList payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-API-Key": YCLOUD_KEY },
+    headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify(payload),
   });
   console.log("sendList response:", res.status, await res.text());
 }
 
-async function executeNode(phone: string, node: any, from: string, autoAdvance = true) {
+async function resolveVariables(text: string, phone: string): Promise<string> {
+  if (!text || !text.includes("{{")) return text;
+  const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
+  if (!contact) return text;
+  const { data: fields } = await sb.from("contact_data").select("field_key, field_value").eq("contact_id", contact.id);
+  let resolved = text;
+  (fields || []).forEach((f: any) => {
+    resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
+  });
+  return resolved;
+}
+
+async function autoAdvanceNode(phone: string, node: any, cfg: FlowConfig) {
+  console.log("autoAdvance desde:", node.node_key);
+  const { data: session } = await sb.from("sessions").select("flow_id").eq("phone", phone).maybeSingle();
+  if (!session) return;
+
+  const { data: edge } = await sb.from("edges").select("*")
+    .eq("flow_id", session.flow_id).eq("from_node", node.node_key).is("condition", null).maybeSingle();
+  if (!edge) return;
+
+  const { data: nextNode } = await sb.from("nodes").select("*")
+    .eq("flow_id", session.flow_id).eq("node_key", edge.to_node).maybeSingle();
+  if (!nextNode) return;
+
+  await sb.from("sessions").update({ current_node: edge.to_node, updated_at: new Date().toISOString() }).eq("phone", phone);
+  const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
+  await executeNode(phone, nodeToSend, cfg);
+
+  if (nextNode.type === "end") {
+    await sb.from("sessions").delete().eq("phone", phone);
+    await sb.from("contacts").update({ status: "en_proceso", updated_at: new Date().toISOString() }).eq("phone", phone);
+  }
+}
+
+async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvance = true) {
   console.log("executeNode:", node.node_key, "type:", node.type);
+  const { from, apiKey } = cfg;
 
   if (node.media_urls?.length > 1) {
-    // Enviar múltiples imágenes en secuencia
     for (let i = 0; i < node.media_urls.length; i++) {
       const caption = i === 0 ? (node.content || "") : "";
-      await sendImage(phone, node.media_urls[i], from, caption);
+      await sendImage(phone, node.media_urls[i], from, apiKey, caption);
       if (i < node.media_urls.length - 1) await new Promise(r => setTimeout(r, 800));
     }
     if (node.options?.length) {
-      await sendButtons(phone, "Elige una opción:", node.options, from);
+      await sendButtons(phone, "Elige una opción:", node.options, from, apiKey);
     } else if (autoAdvance) {
-      await autoAdvanceNode(phone, node, from);
+      await autoAdvanceNode(phone, node, cfg);
     }
     return;
   }
 
   if (node.media_url) {
-    await sendImage(phone, node.media_url, from, node.content || "");
+    await sendImage(phone, node.media_url, from, apiKey, node.content || "");
     if (node.options?.length) {
-      await sendButtons(phone, "Elige una opción:", node.options, from);
+      await sendButtons(phone, "Elige una opción:", node.options, from, apiKey);
     } else if (autoAdvance) {
-      await autoAdvanceNode(phone, node, from);
+      await autoAdvanceNode(phone, node, cfg);
     }
     return;
   }
@@ -206,20 +218,20 @@ async function executeNode(phone: string, node: any, from: string, autoAdvance =
       node.list_button || "Ver opciones",
       node.list_section || "Opciones",
       node.options,
-      from
+      from, apiKey
     );
     return;
   }
 
   if (node.options?.length) {
-    await sendButtons(phone, node.content || "Elige una opción:", node.options, from);
+    await sendButtons(phone, node.content || "Elige una opción:", node.options, from, apiKey);
     return;
   }
 
-  if (node.content) await sendText(phone, node.content, from);
+  if (node.content) await sendText(phone, node.content, from, apiKey);
 
   if (node.type === "message" && autoAdvance) {
-    await autoAdvanceNode(phone, node, from);
+    await autoAdvanceNode(phone, node, cfg);
   }
 }
 
@@ -233,12 +245,11 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   console.log("session:", JSON.stringify(session), "err:", JSON.stringify(se));
 
   if (!session) {
-    // Buscar flujo activo por número receptor
-    let { data: flow } = await sb.from("flows").select("id, whatsapp_phone")
+    let { data: flow } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
       .eq("is_active", true).eq("whatsapp_phone", toPhone).maybeSingle();
 
     if (!flow) {
-      const { data: anyFlow } = await sb.from("flows").select("id, whatsapp_phone")
+      const { data: anyFlow } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
         .eq("is_active", true).maybeSingle();
       flow = anyFlow;
     }
@@ -246,7 +257,10 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     console.log("flow:", JSON.stringify(flow));
     if (!flow) { console.log("NO ACTIVE FLOW"); return; }
 
-    const from = await getFromPhone(flow.id);
+    const cfg: FlowConfig = {
+      from: flow.whatsapp_phone || "+526181239810",
+      apiKey: flow.ycloud_api_key || YCLOUD_KEY_FALLBACK,
+    };
 
     let { data: firstNode } = await sb.from("nodes").select("*")
       .eq("flow_id", flow.id).eq("is_start", true).maybeSingle();
@@ -269,11 +283,11 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     );
 
     const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone) };
-    await executeNode(phone, nodeToSend, from);
+    await executeNode(phone, nodeToSend, cfg);
     return;
   }
 
-  const from = await getFromPhone(session.flow_id);
+  const cfg = await getFlowConfig(session.flow_id);
 
   await sb.from("message_log").insert({
     phone, direction: "in", content: userMessage, node_key: session.current_node,
@@ -283,11 +297,9 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     .eq("flow_id", session.flow_id).eq("node_key", session.current_node).maybeSingle();
   console.log("currentNode:", JSON.stringify(currentNode));
 
-  // ── Capturar y normalizar con DeepSeek ──
   if (currentNode?.capture_field) {
     const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
     if (contact) {
-      // Normalizar el valor con DeepSeek
       const normalizedValue = await normalizeField(currentNode.capture_field, userMessage.trim());
 
       await sb.from("contact_data").upsert(
@@ -298,7 +310,6 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     }
   }
 
-  // ── Buscar siguiente nodo ──
   let { data: edge } = await sb.from("edges").select("*")
     .eq("flow_id", session.flow_id).eq("from_node", session.current_node)
     .ilike("condition", userMessage.trim()).maybeSingle();
@@ -311,7 +322,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   }
 
   if (!edge) {
-    await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.", from);
+    await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.", cfg.from, cfg.apiKey);
     return;
   }
 
@@ -324,7 +335,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   }).eq("phone", phone);
 
   const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
-  await executeNode(phone, nodeToSend, from);
+  await executeNode(phone, nodeToSend, cfg);
 
   if (nextNode.type === "end") {
     await sb.from("sessions").delete().eq("phone", phone);
