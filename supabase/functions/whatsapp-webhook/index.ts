@@ -79,7 +79,18 @@ async function getFlowConfig(flowId: string): Promise<FlowConfig> {
 // ============================================================
 // YCLOUD — Envío de mensajes (cada llamada usa la API key de SU flujo)
 // ============================================================
-async function sendText(to: string, text: string, from: string, apiKey: string) {
+// Registra cada intento de envío saliente, con su estatus real (enviado/fallido)
+async function logOutbound(to: string, content: string, nodeKey: string | null, ok: boolean, errorDetail: string | null) {
+  try {
+    await sb.from("message_log").insert({
+      phone: to, direction: "out", content, node_key: nodeKey,
+      status: ok ? "sent" : "failed",
+      error_detail: ok ? null : (errorDetail || "").slice(0, 500),
+    });
+  } catch(e) { console.error("Error guardando message_log:", e); }
+}
+
+async function sendText(to: string, text: string, from: string, apiKey: string, nodeKey: string | null = null) {
   const payload = { from, to, type: "text", text: { body: text } };
   console.log("sendText payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
@@ -87,10 +98,12 @@ async function sendText(to: string, text: string, from: string, apiKey: string) 
     headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify(payload),
   });
-  console.log("sendText response:", res.status, await res.text());
+  const resText = await res.text();
+  console.log("sendText response:", res.status, resText);
+  await logOutbound(to, text, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
 }
 
-async function sendImage(to: string, url: string, from: string, apiKey: string, caption?: string) {
+async function sendImage(to: string, url: string, from: string, apiKey: string, caption?: string, nodeKey: string | null = null) {
   const payload: any = { from, to, type: "image", image: { link: url } };
   if (caption) payload.image.caption = caption;
   const res = await fetch(YCLOUD_URL, {
@@ -98,10 +111,12 @@ async function sendImage(to: string, url: string, from: string, apiKey: string, 
     headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify(payload),
   });
-  console.log("sendImage response:", res.status, await res.text());
+  const resText = await res.text();
+  console.log("sendImage response:", res.status, resText);
+  await logOutbound(to, caption || `[Imagen] ${url}`, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
 }
 
-async function sendButtons(to: string, text: string, options: { label: string; value: string }[], from: string, apiKey: string) {
+async function sendButtons(to: string, text: string, options: { label: string; value: string }[], from: string, apiKey: string, nodeKey: string | null = null) {
   const buttons = options.slice(0, 3).map((o) => ({
     type: "reply",
     reply: { id: o.value, title: o.label.slice(0, 20) },
@@ -115,10 +130,12 @@ async function sendButtons(to: string, text: string, options: { label: string; v
     headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify(payload),
   });
-  console.log("sendButtons response:", res.status, await res.text());
+  const resText = await res.text();
+  console.log("sendButtons response:", res.status, resText);
+  await logOutbound(to, text, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
 }
 
-async function sendList(to: string, body: string, buttonText: string, sectionTitle: string, items: { label: string; value: string; description?: string }[], from: string, apiKey: string) {
+async function sendList(to: string, body: string, buttonText: string, sectionTitle: string, items: { label: string; value: string; description?: string }[], from: string, apiKey: string, nodeKey: string | null = null) {
   const rows = items.map(item => ({
     id: item.value,
     title: item.label.slice(0, 24),
@@ -145,7 +162,9 @@ async function sendList(to: string, body: string, buttonText: string, sectionTit
     headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify(payload),
   });
-  console.log("sendList response:", res.status, await res.text());
+  const resText = await res.text();
+  console.log("sendList response:", res.status, resText);
+  await logOutbound(to, body, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
 }
 
 async function resolveVariables(text: string, phone: string): Promise<string> {
@@ -190,11 +209,11 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
   if (node.media_urls?.length > 1) {
     for (let i = 0; i < node.media_urls.length; i++) {
       const caption = i === 0 ? (node.content || "") : "";
-      await sendImage(phone, node.media_urls[i], from, apiKey, caption);
+      await sendImage(phone, node.media_urls[i], from, apiKey, caption, node.node_key);
       if (i < node.media_urls.length - 1) await new Promise(r => setTimeout(r, 800));
     }
     if (node.options?.length) {
-      await sendButtons(phone, "Elige una opción:", node.options, from, apiKey);
+      await sendButtons(phone, "Elige una opción:", node.options, from, apiKey, node.node_key);
     } else if (autoAdvance) {
       await autoAdvanceNode(phone, node, cfg);
     }
@@ -202,9 +221,9 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
   }
 
   if (node.media_url) {
-    await sendImage(phone, node.media_url, from, apiKey, node.content || "");
+    await sendImage(phone, node.media_url, from, apiKey, node.content || "", node.node_key);
     if (node.options?.length) {
-      await sendButtons(phone, "Elige una opción:", node.options, from, apiKey);
+      await sendButtons(phone, "Elige una opción:", node.options, from, apiKey, node.node_key);
     } else if (autoAdvance) {
       await autoAdvanceNode(phone, node, cfg);
     }
@@ -218,17 +237,17 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
       node.list_button || "Ver opciones",
       node.list_section || "Opciones",
       node.options,
-      from, apiKey
+      from, apiKey, node.node_key
     );
     return;
   }
 
   if (node.options?.length) {
-    await sendButtons(phone, node.content || "Elige una opción:", node.options, from, apiKey);
+    await sendButtons(phone, node.content || "Elige una opción:", node.options, from, apiKey, node.node_key);
     return;
   }
 
-  if (node.content) await sendText(phone, node.content, from, apiKey);
+  if (node.content) await sendText(phone, node.content, from, apiKey, node.node_key);
 
   if (node.type === "message" && autoAdvance) {
     await autoAdvanceNode(phone, node, cfg);
@@ -245,6 +264,25 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   console.log("session:", JSON.stringify(session), "err:", JSON.stringify(se));
 
   if (!session) {
+    // Si ya existe un contacto que completo su registro anteriormente, no reiniciar
+    // el flujo desde cero — eso le borraba el estatus y lo regresaba a "nuevo".
+    const { data: contactoExistente } = await sb.from("contacts")
+      .select("status, flow_id").eq("phone", phone).maybeSingle();
+
+    const estatusFinalizados = ["en_proceso", "contratado", "rechazado", "descartado", "no_responde"];
+    if (contactoExistente && estatusFinalizados.includes(contactoExistente.status)) {
+      const cfgExistente = await getFlowConfig(contactoExistente.flow_id);
+      await sendText(
+        phone,
+        "Hola de nuevo! Tu registro ya quedo completo anteriormente. En breve alguien de nuestro equipo se pondra en contacto contigo.\n\nSi necesitas avisarnos algo en especifico sobre tu proceso, puedes escribirlo aqui y lo revisamos.",
+        cfgExistente.from, cfgExistente.apiKey
+      );
+      await sb.from("message_log").insert({
+        phone, direction: "in", content: userMessage, node_key: "post_registro",
+      });
+      return;
+    }
+
     let { data: flow } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
       .eq("is_active", true).eq("whatsapp_phone", toPhone).maybeSingle();
 
@@ -322,7 +360,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   }
 
   if (!edge) {
-    await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.", cfg.from, cfg.apiKey);
+    await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.", cfg.from, cfg.apiKey, session.current_node);
     return;
   }
 
