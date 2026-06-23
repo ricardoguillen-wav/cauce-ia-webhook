@@ -51,7 +51,9 @@ async function sendText(to: string, text: string, from: string, apiKey: string) 
     headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
     body: JSON.stringify({ from, to, type: "text", text: { body: text } }),
   });
-  console.log("sendText:", res.status, await res.text());
+  const resText = await res.text();
+  console.log("sendText:", res.status, resText);
+  return { ok: res.ok, detail: `HTTP ${res.status}: ${resText}` };
 }
 
 async function interpretarFecha(disponibilidad: string): Promise<string | null> {
@@ -128,43 +130,50 @@ async function procesarParaUsuario(usuario: any, tipo: "noche" | "manana") {
   let enviados = 0;
 
   for (const contact of contactsRows) {
-    if (["contratado", "rechazado", "descartado"].includes(contact.status)) continue;
-    if (contact.bot_paused) continue;
+    try {
+      if (["contratado", "rechazado", "descartado"].includes(contact.status)) continue;
+      if (contact.bot_paused) continue;
 
-    const datos: Record<string, string> = {};
-    (contact.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
+      const datos: Record<string, string> = {};
+      (contact.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
 
-    const disponibilidad = datos.disponibilidad;
-    if (!disponibilidad) continue;
+      const disponibilidad = datos.disponibilidad;
+      if (!disponibilidad) continue;
 
-    const fechaCita = await interpretarFecha(disponibilidad);
-    if (!fechaCita || fechaCita !== objetivoISO) continue;
+      const fechaCita = await interpretarFecha(disponibilidad);
+      if (!fechaCita || fechaCita !== objetivoISO) continue;
 
-    const flow = flowById[contact.flow_id];
-    if (!flow) continue;
+      const flow = flowById[contact.flow_id];
+      if (!flow) continue;
 
-    const from   = flow.whatsapp_phone || "+526181239810";
-    const apiKey = flow.ycloud_api_key || YCLOUD_KEY_FALLBACK;
+      const from   = flow.whatsapp_phone || "+526181239810";
+      const apiKey = flow.ycloud_api_key || YCLOUD_KEY_FALLBACK;
 
-    const plantilla = tipo === "noche"
-      ? (usuario.reminder_msg_noche || DEFAULT_MSG_NOCHE)
-      : (usuario.reminder_msg_manana || DEFAULT_MSG_MANANA);
+      const plantilla = tipo === "noche"
+        ? (usuario.reminder_msg_noche || DEFAULT_MSG_NOCHE)
+        : (usuario.reminder_msg_manana || DEFAULT_MSG_MANANA);
 
-    const mensaje = aplicarVariables(plantilla, {
-      nombre: datos.nombre || "Candidato",
-      empresa: datos.empresa || "la empresa",
-      puesto: datos.puesto || "el puesto",
-      disponibilidad,
-    });
+      const mensaje = aplicarVariables(plantilla, {
+        nombre: datos.nombre || "Candidato",
+        empresa: datos.empresa || "la empresa",
+        puesto: datos.puesto || "el puesto",
+        disponibilidad,
+      });
 
-    await sendText(contact.phone, mensaje, from, apiKey);
-    await sb.from("message_log").insert({
-      phone: contact.phone, direction: "out", content: mensaje, node_key: `recordatorio_${tipo}`,
-    });
+      const resultado = await sendText(contact.phone, mensaje, from, apiKey);
+      await sb.from("message_log").insert({
+        phone: contact.phone, direction: "out", content: mensaje, node_key: `recordatorio_${tipo}`,
+        status: resultado.ok ? "sent" : "failed",
+        error_detail: resultado.ok ? null : resultado.detail.slice(0, 500),
+      });
 
-    console.log(`Recordatorio ${tipo} → ${contact.phone} (usuario: ${usuario.username})`);
-    enviados++;
-    await new Promise(r => setTimeout(r, 500));
+      console.log(`Recordatorio ${tipo} → ${contact.phone} (usuario: ${usuario.username})`);
+      enviados++;
+      await new Promise(r => setTimeout(r, 500));
+    } catch(e) {
+      // Un contacto con problemas no debe detener al resto de los contactos de este mismo cliente
+      console.error(`Error en recordatorio para contacto ${contact.phone} (usuario ${usuario.username}):`, e);
+    }
   }
 
   return enviados;
@@ -189,21 +198,39 @@ async function revisarYEnviarRecordatorios() {
   }
 
   let totalEnviados = 0;
+  const resultadosPorUsuario: Record<string, any> = {};
 
   for (const usuario of usuarios) {
     const horaNoche  = redondear15(usuario.reminder_hora_noche  || "21:00");
     const horaManana = redondear15(usuario.reminder_hora_manana || "08:00");
 
-    if (horaActual === horaNoche) {
-      totalEnviados += await procesarParaUsuario(usuario, "noche");
+    // Cada cliente se procesa de forma aislada — si uno falla, los demás
+    // siguen su curso normal en esta misma corrida.
+    try {
+      if (horaActual === horaNoche) {
+        const enviados = await procesarParaUsuario(usuario, "noche");
+        totalEnviados += enviados;
+        resultadosPorUsuario[usuario.username] = { ok: true, tipo: "noche", enviados };
+      }
+    } catch(e) {
+      console.error(`Error procesando recordatorio "noche" para ${usuario.username}:`, e);
+      resultadosPorUsuario[usuario.username] = { ok: false, tipo: "noche", error: String(e) };
     }
-    if (horaActual === horaManana) {
-      totalEnviados += await procesarParaUsuario(usuario, "manana");
+
+    try {
+      if (horaActual === horaManana) {
+        const enviados = await procesarParaUsuario(usuario, "manana");
+        totalEnviados += enviados;
+        resultadosPorUsuario[usuario.username] = { ok: true, tipo: "manana", enviados };
+      }
+    } catch(e) {
+      console.error(`Error procesando recordatorio "manana" para ${usuario.username}:`, e);
+      resultadosPorUsuario[usuario.username] = { ok: false, tipo: "manana", error: String(e) };
     }
   }
 
   console.log(`Ciclo completado: ${totalEnviados} recordatorios enviados`);
-  return { revisados: usuarios.length, enviados: totalEnviados };
+  return { revisados: usuarios.length, enviados: totalEnviados, detalle: resultadosPorUsuario };
 }
 
 // ============================================================
