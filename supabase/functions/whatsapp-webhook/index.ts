@@ -11,6 +11,9 @@ const YCLOUD_URL   = "https://api.ycloud.com/v2/whatsapp/messages";
 const DEEPSEEK_KEY = Deno.env.get("DEEPSEEK_API_KEY")!;
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 
+// Credenciales de la cuenta de servicio de Google (el JSON completo, pegado tal cual)
+const GOOGLE_SA_JSON = Deno.env.get("GOOGLE_SERVICE_ACCOUNT_JSON") || "";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -91,7 +94,8 @@ async function logOutbound(to: string, content: string, nodeKey: string | null, 
 }
 
 async function sendText(to: string, text: string, from: string, apiKey: string, nodeKey: string | null = null) {
-  const payload = { from, to, type: "text", text: { body: text } };
+  const textoSeguro = (text || "").slice(0, 4096); // limite de WhatsApp para texto plano
+  const payload = { from, to, type: "text", text: { body: textoSeguro } };
   console.log("sendText payload:", JSON.stringify(payload));
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
@@ -100,12 +104,13 @@ async function sendText(to: string, text: string, from: string, apiKey: string, 
   });
   const resText = await res.text();
   console.log("sendText response:", res.status, resText);
-  await logOutbound(to, text, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
+  await logOutbound(to, textoSeguro, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
 }
 
 async function sendImage(to: string, url: string, from: string, apiKey: string, caption?: string, nodeKey: string | null = null) {
+  const captionSeguro = caption ? caption.slice(0, 1024) : caption; // limite de caption en imagenes
   const payload: any = { from, to, type: "image", image: { link: url } };
-  if (caption) payload.image.caption = caption;
+  if (captionSeguro) payload.image.caption = captionSeguro;
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
@@ -113,17 +118,19 @@ async function sendImage(to: string, url: string, from: string, apiKey: string, 
   });
   const resText = await res.text();
   console.log("sendImage response:", res.status, resText);
-  await logOutbound(to, caption || `[Imagen] ${url}`, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
+  const registroLog = captionSeguro ? `[Imagen] ${url}\n${captionSeguro}` : `[Imagen] ${url}`;
+  await logOutbound(to, registroLog, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
 }
 
 async function sendButtons(to: string, text: string, options: { label: string; value: string }[], from: string, apiKey: string, nodeKey: string | null = null) {
+  const textoSeguro = (text || "Elige una opcion:").slice(0, 1024); // limite del body en mensajes interactivos
   const buttons = options.slice(0, 3).map((o) => ({
     type: "reply",
     reply: { id: o.value, title: o.label.slice(0, 20) },
   }));
   const payload = {
     from, to, type: "interactive",
-    interactive: { type: "button", body: { text }, action: { buttons } },
+    interactive: { type: "button", body: { text: textoSeguro }, action: { buttons } },
   };
   const res = await fetch(YCLOUD_URL, {
     method: "POST",
@@ -132,10 +139,11 @@ async function sendButtons(to: string, text: string, options: { label: string; v
   });
   const resText = await res.text();
   console.log("sendButtons response:", res.status, resText);
-  await logOutbound(to, text, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
+  await logOutbound(to, textoSeguro, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
 }
 
 async function sendList(to: string, body: string, buttonText: string, sectionTitle: string, items: { label: string; value: string; description?: string }[], from: string, apiKey: string, nodeKey: string | null = null) {
+  const bodySeguro = (body || "Elige una opcion:").slice(0, 1024); // limite del body en mensajes interactivos
   const rows = items.map(item => ({
     id: item.value,
     title: item.label.slice(0, 24),
@@ -146,7 +154,7 @@ async function sendList(to: string, body: string, buttonText: string, sectionTit
     type: "interactive",
     interactive: {
       type: "list",
-      body: { text: body },
+      body: { text: bodySeguro },
       action: {
         button: buttonText.slice(0, 20) || "Ver opciones",
         sections: [{
@@ -164,7 +172,182 @@ async function sendList(to: string, body: string, buttonText: string, sectionTit
   });
   const resText = await res.text();
   console.log("sendList response:", res.status, resText);
-  await logOutbound(to, body, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
+  await logOutbound(to, bodySeguro, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
+}
+
+// ============================================================
+// GOOGLE SHEETS — un libro por número de WhatsApp, en tiempo real
+// ============================================================
+let cachedGoogleToken: { token: string; expiresAt: number } | null = null;
+
+function base64url(input: ArrayBuffer | string): string {
+  const bytes = typeof input === "string" ? new TextEncoder().encode(input) : new Uint8Array(input);
+  let str = "";
+  for (const b of bytes) str += String.fromCharCode(b);
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function getGoogleAccessToken(): Promise<string | null> {
+  if (!GOOGLE_SA_JSON) return null;
+  if (cachedGoogleToken && cachedGoogleToken.expiresAt > Date.now() + 60000) {
+    return cachedGoogleToken.token;
+  }
+
+  try {
+    const sa = JSON.parse(GOOGLE_SA_JSON);
+    const now = Math.floor(Date.now() / 1000);
+    const header = { alg: "RS256", typ: "JWT" };
+    const claimSet = {
+      iss: sa.client_email,
+      scope: "https://www.googleapis.com/auth/spreadsheets",
+      aud: "https://oauth2.googleapis.com/token",
+      exp: now + 3600,
+      iat: now,
+    };
+    const unsigned = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claimSet))}`;
+
+    const pemBody = sa.private_key
+      .replace("-----BEGIN PRIVATE KEY-----", "")
+      .replace("-----END PRIVATE KEY-----", "")
+      .replace(/\s/g, "");
+    const binaryDer = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
+    const cryptoKey = await crypto.subtle.importKey(
+      "pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]
+    );
+    const signature = await crypto.subtle.sign(
+      "RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(unsigned)
+    );
+    const jwt = `${unsigned}.${base64url(signature)}`;
+
+    const res = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+    });
+    const data = await res.json();
+    if (!data.access_token) {
+      console.error("Google token error:", JSON.stringify(data));
+      return null;
+    }
+    cachedGoogleToken = { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
+    return data.access_token;
+  } catch(e) {
+    console.error("Error generando token de Google:", e);
+    return null;
+  }
+}
+
+async function sheetsGet(sheetId: string, range: string): Promise<any> {
+  const token = await getGoogleAccessToken();
+  if (!token) return null;
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) { console.error("sheetsGet error:", res.status, await res.text()); return null; }
+  return await res.json();
+}
+
+async function sheetsUpdate(sheetId: string, range: string, values: any[][]): Promise<boolean> {
+  const token = await getGoogleAccessToken();
+  if (!token) return false;
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`,
+    {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ values }),
+    }
+  );
+  if (!res.ok) console.error("sheetsUpdate error:", res.status, await res.text());
+  return res.ok;
+}
+
+async function sheetsAppend(sheetId: string, range: string, values: any[][]): Promise<boolean> {
+  const token = await getGoogleAccessToken();
+  if (!token) return false;
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ values }),
+    }
+  );
+  if (!res.ok) console.error("sheetsAppend error:", res.status, await res.text());
+  return res.ok;
+}
+
+const CORE_COLS = ["Telefono", "Nombre", "Estatus", "Flujo", "Fecha de registro", "Ultima actualizacion"];
+
+function tituloCampo(key: string): string {
+  return key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, " ");
+}
+
+// Sincroniza UN contacto a su Google Sheet correspondiente. Nunca lanza error
+// hacia afuera — si Sheets falla, el chat debe seguir funcionando normal.
+async function syncContactToSheet(phone: string) {
+  if (!GOOGLE_SA_JSON) return; // integracion no configurada, no hacer nada
+  try {
+    const { data: contact } = await sb.from("contacts")
+      .select("*, contact_data(field_key, field_value)").eq("phone", phone).maybeSingle();
+    if (!contact) return;
+
+    const { data: flow } = await sb.from("flows").select("whatsapp_phone, name").eq("id", contact.flow_id).maybeSingle();
+    if (!flow?.whatsapp_phone) return;
+
+    const { data: waNumber } = await sb.from("wa_numbers")
+      .select("google_sheet_id").eq("phone", flow.whatsapp_phone).maybeSingle();
+    const sheetId = waNumber?.google_sheet_id;
+    if (!sheetId) return; // este numero no tiene libro asignado
+
+    const datos: Record<string, string> = {};
+    (contact.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
+
+    // Leer encabezado actual (fila 1)
+    const headerData = await sheetsGet(sheetId, "A1:Z1");
+    let header: string[] = headerData?.values?.[0] || [];
+    let headerNuevo = false;
+
+    if (header.length === 0) {
+      header = [...CORE_COLS];
+      headerNuevo = true;
+    }
+
+    // Agregar columnas nuevas si aparecen campos que el encabezado no contempla
+    for (const key of Object.keys(datos)) {
+      const colName = tituloCampo(key);
+      if (!header.includes(colName)) { header.push(colName); headerNuevo = true; }
+    }
+
+    if (headerNuevo) await sheetsUpdate(sheetId, "A1", [header]);
+
+    // Construir la fila en el mismo orden que el encabezado
+    const row = header.map((col) => {
+      if (col === "Telefono") return phone;
+      if (col === "Nombre") return datos["nombre"] || "";
+      if (col === "Estatus") return contact.status || "";
+      if (col === "Flujo") return flow.name || "";
+      if (col === "Fecha de registro") return contact.created_at || "";
+      if (col === "Ultima actualizacion") return new Date().toISOString();
+      const key = col.toLowerCase().replace(/ /g, "_");
+      return datos[key] ?? "";
+    });
+
+    // Buscar si el contacto ya tiene fila (columna A = telefono)
+    const colA = await sheetsGet(sheetId, "A2:A2000");
+    const existentes: string[] = (colA?.values || []).map((r: any) => r[0]);
+    const idx = existentes.indexOf(phone);
+
+    if (idx >= 0) {
+      const rowNumber = idx + 2;
+      await sheetsUpdate(sheetId, `A${rowNumber}`, [row]);
+    } else {
+      await sheetsAppend(sheetId, "A1", [row]);
+    }
+  } catch(e) {
+    console.error("Error sincronizando a Google Sheets:", phone, e);
+  }
 }
 
 async function resolveVariables(text: string, phone: string): Promise<string> {
@@ -199,6 +382,7 @@ async function autoAdvanceNode(phone: string, node: any, cfg: FlowConfig) {
   if (nextNode.type === "end") {
     await sb.from("sessions").delete().eq("phone", phone);
     await sb.from("contacts").update({ status: "en_proceso", updated_at: new Date().toISOString() }).eq("phone", phone);
+    await syncContactToSheet(phone);
   }
 }
 
@@ -319,6 +503,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       { phone, flow_id: flow.id, current_node: firstNode.node_key, updated_at: new Date().toISOString() },
       { onConflict: "phone" }
     );
+    await syncContactToSheet(phone); // se espera para garantizar que quede guardado antes de responder
 
     const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone) };
     await executeNode(phone, nodeToSend, cfg);
@@ -345,6 +530,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
         { onConflict: "contact_id,field_key" }
       );
       console.log(`Captured & normalized: ${currentNode.capture_field} = "${userMessage}" → "${normalizedValue}"`);
+      await syncContactToSheet(phone); // se espera para garantizar que quede guardado antes de responder
     }
   }
 
@@ -380,6 +566,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     await sb.from("contacts").update({
       status: "en_proceso", updated_at: new Date().toISOString(),
     }).eq("phone", phone);
+    await syncContactToSheet(phone);
   }
 }
 
