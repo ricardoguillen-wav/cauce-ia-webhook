@@ -132,14 +132,16 @@ o
 // ============================================================
 type FlowConfig = { from: string; apiKey: string };
 
-async function getFlowConfig(flowId: string): Promise<FlowConfig> {
+async function getFlowConfig(flowId: string, toPhoneFallback: string = ""): Promise<FlowConfig> {
   const { data } = await sb.from("flows")
     .select("whatsapp_phone, ycloud_api_key")
     .eq("id", flowId)
     .maybeSingle();
 
   return {
-    from: data?.whatsapp_phone || "+526181239810",
+    // Si el flujo no tiene número configurado, usar el número que recibió el mensaje
+    // para no responder desde el número equivocado de otro cliente
+    from: data?.whatsapp_phone || toPhoneFallback || "",
     apiKey: data?.ycloud_api_key || YCLOUD_KEY_FALLBACK,
   };
 }
@@ -541,7 +543,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
 
     const estatusFinalizados = ["en_proceso", "contratado", "rechazado", "descartado", "no_responde"];
     if (contactoExistente && estatusFinalizados.includes(contactoExistente.status)) {
-      const cfgExistente = await getFlowConfig(contactoExistente.flow_id);
+      const cfgExistente = await getFlowConfig(contactoExistente.flow_id, toPhone);
       await sendText(
         phone,
         "Hola de nuevo! Tu registro ya quedo completo anteriormente. En breve alguien de nuestro equipo se pondra en contacto contigo.\n\nSi necesitas avisarnos algo en especifico sobre tu proceso, puedes escribirlo aqui y lo revisamos.",
@@ -553,17 +555,29 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       return;
     }
 
+    // Normalizar el número destino — yCloud puede mandar con o sin el "+"
+    // y el número guardado en la BD puede tener formatos distintos.
+    // Buscamos con ambas variantes para no depender del formato exacto.
+    const toPhoneNorm  = toPhone.startsWith('+') ? toPhone : '+' + toPhone;
+    const toPhonePlain = toPhone.replace(/^\+/, '');
+
     let { data: flow } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
-      .eq("is_active", true).eq("whatsapp_phone", toPhone).maybeSingle();
+      .eq("is_active", true).eq("whatsapp_phone", toPhoneNorm).maybeSingle();
 
     if (!flow) {
-      const { data: anyFlow } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
-        .eq("is_active", true).maybeSingle();
-      flow = anyFlow;
+      const { data: flow2 } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
+        .eq("is_active", true).eq("whatsapp_phone", toPhonePlain).maybeSingle();
+      flow = flow2;
     }
 
-    console.log("flow:", JSON.stringify(flow));
-    if (!flow) { console.log("NO ACTIVE FLOW"); return; }
+    // Sin fallback a "cualquier flujo activo" — si el número no tiene flujo
+    // asignado, el mensaje se ignora. Esto evita que un número responda
+    // con el flujo de otro cliente.
+    console.log("flow encontrado para", toPhone, ":", flow?.id || "NINGUNO");
+    if (!flow) {
+      console.log("NO ACTIVE FLOW para el número", toPhone, "— mensaje ignorado");
+      return;
+    }
 
     const cfg: FlowConfig = {
       from: flow.whatsapp_phone || "+526181239810",
@@ -596,7 +610,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     return;
   }
 
-  const cfg = await getFlowConfig(session.flow_id);
+  const cfg = await getFlowConfig(session.flow_id, toPhone);
 
   await sb.from("message_log").insert({
     phone, direction: "in", content: userMessage, node_key: session.current_node,
