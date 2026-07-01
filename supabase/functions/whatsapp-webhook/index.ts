@@ -532,8 +532,23 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
 async function processMessage(phone: string, userMessage: string, toPhone: string) {
   console.log("processMessage — phone:", phone, "msg:", userMessage, "to:", toPhone);
 
-  const { data: session, error: se } = await sb.from("sessions").select("*").eq("phone", phone).maybeSingle();
-  console.log("session:", JSON.stringify(session), "err:", JSON.stringify(se));
+  // Normalizar toPhone una sola vez aquí para usar en todo el proceso
+  const toPhoneNorm  = toPhone.startsWith('+') ? toPhone : '+' + toPhone;
+  const toPhonePlain = toPhone.replace(/^\+/, '');
+
+  // Buscar sesión filtrando también por to_phone — así dos números distintos
+  // nunca comparten sesión aunque el mismo candidato les haya escrito a ambos.
+  let { data: session } = await sb.from("sessions").select("*")
+    .eq("phone", phone).eq("to_phone", toPhoneNorm).maybeSingle();
+
+  if (!session) {
+    // Intentar también con formato sin "+"
+    const { data: session2 } = await sb.from("sessions").select("*")
+      .eq("phone", phone).eq("to_phone", toPhonePlain).maybeSingle();
+    session = session2;
+  }
+
+  console.log("session:", JSON.stringify(session));
 
   if (!session) {
     // Si ya existe un contacto que completo su registro anteriormente, no reiniciar
@@ -555,12 +570,6 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       return;
     }
 
-    // Normalizar el número destino — yCloud puede mandar con o sin el "+"
-    // y el número guardado en la BD puede tener formatos distintos.
-    // Buscamos con ambas variantes para no depender del formato exacto.
-    const toPhoneNorm  = toPhone.startsWith('+') ? toPhone : '+' + toPhone;
-    const toPhonePlain = toPhone.replace(/^\+/, '');
-
     let { data: flow } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
       .eq("is_active", true).eq("whatsapp_phone", toPhoneNorm).maybeSingle();
 
@@ -580,7 +589,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     }
 
     const cfg: FlowConfig = {
-      from: flow.whatsapp_phone || "+526181239810",
+      from: flow.whatsapp_phone || toPhoneNorm,
       apiKey: flow.ycloud_api_key || YCLOUD_KEY_FALLBACK,
     };
 
@@ -599,9 +608,10 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       { phone, flow_id: flow.id, status: "nuevo", updated_at: new Date().toISOString() },
       { onConflict: "phone" }
     );
+    // Guardar to_phone en la sesión para aislar conversaciones por número
     await sb.from("sessions").upsert(
-      { phone, flow_id: flow.id, current_node: firstNode.node_key, updated_at: new Date().toISOString() },
-      { onConflict: "phone" }
+      { phone, to_phone: toPhoneNorm, flow_id: flow.id, current_node: firstNode.node_key, updated_at: new Date().toISOString() },
+      { onConflict: "phone,to_phone" }
     );
     await syncContactToSheet(phone); // se espera para garantizar que quede guardado antes de responder
 
@@ -678,7 +688,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   await executeNode(phone, nodeToSend, cfg);
 
   if (nextNode.type === "end") {
-    await sb.from("sessions").delete().eq("phone", phone);
+    await sb.from("sessions").delete().eq("phone", phone).eq("to_phone", toPhoneNorm);
     await sb.from("contacts").update({
       status: "en_proceso", updated_at: new Date().toISOString(),
     }).eq("phone", phone);
