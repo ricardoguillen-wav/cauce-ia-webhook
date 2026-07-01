@@ -63,6 +63,71 @@ async function normalizeField(fieldKey: string, rawValue: string): Promise<strin
 }
 
 // ============================================================
+// DEEPSEEK — Validar que la respuesta corresponda a la pregunta
+// Si el candidato pone "buenos días" cuando se le pregunta el nombre,
+// el bot le pide que responda correctamente sin avanzar en el flujo.
+// ============================================================
+async function validarRespuesta(
+  fieldKey: string,
+  pregunta: string,
+  respuesta: string
+): Promise<{ valido: boolean; error: string }> {
+
+  // Campos de selección con botones — el usuario no puede equivocarse
+  const camposSinValidar = ['transporte', 'area', 'puesto', 'turno_preferido', 'disponibilidad'];
+  if (camposSinValidar.includes(fieldKey.toLowerCase())) {
+    return { valido: true, error: '' };
+  }
+
+  const prompt = `Eres un asistente que valida respuestas en un chatbot de reclutamiento en México.
+
+La pregunta que se le hizo al candidato fue: "${pregunta}"
+Campo que se quiere capturar: "${fieldKey}"
+Respuesta del candidato: "${respuesta}"
+
+Determina si la respuesta es válida para esa pregunta.
+
+Ejemplos de respuestas INVÁLIDAS:
+- Saludos en lugar del dato ("buenos días", "hola", "buenas tardes", "qué tal")
+- Preguntas en lugar del dato ("¿cuánto pagan?", "¿dónde queda?", "¿qué necesito llevar?")
+- Respuestas completamente fuera de contexto ("ok", "sí", "no", "gracias")
+- Texto sin sentido o muy corto que no corresponde al campo pedido
+
+Ejemplos de respuestas VÁLIDAS para nombre: "Juan García", "me llamo Pedro López", "Pedro"
+Ejemplos de respuestas VÁLIDAS para municipio: "Guadalupe", "vivo en Apodaca", "San Nicolás"
+
+Responde ÚNICAMENTE con JSON sin texto adicional ni bloques de código:
+{"valido": true, "error": ""}
+o
+{"valido": false, "error": "mensaje corto y amable en español pidiendo que responda con el dato correcto"}`;
+
+  try {
+    const res = await fetch(DEEPSEEK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${DEEPSEEK_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 120,
+        temperature: 0
+      })
+    });
+    const data = await res.json();
+    const content = (data?.choices?.[0]?.message?.content || '').trim();
+    const limpio = content.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(limpio);
+    console.log(`validarRespuesta [${fieldKey}]: "${respuesta}" → valido=${parsed.valido}`);
+    return { valido: parsed.valido ?? true, error: parsed.error || '' };
+  } catch(e) {
+    console.error('Error validando respuesta con DeepSeek:', e);
+    return { valido: true, error: '' }; // Si falla la API, dejar pasar para no bloquear el flujo
+  }
+}
+
+// ============================================================
 // CONFIGURACIÓN DEL FLUJO — número + API key propios
 // ============================================================
 type FlowConfig = { from: string; apiKey: string };
@@ -386,15 +451,27 @@ async function autoAdvanceNode(phone: string, node: any, cfg: FlowConfig) {
   }
 }
 
+// Valida que una URL sea real antes de mandarla a yCloud
+function esUrlValida(url: any): boolean {
+  if (!url || typeof url !== "string") return false;
+  const limpia = url.trim();
+  return limpia.startsWith("https://") || limpia.startsWith("http://");
+}
+
 async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvance = true) {
   console.log("executeNode:", node.node_key, "type:", node.type);
   const { from, apiKey } = cfg;
 
   if (node.media_urls?.length > 1) {
-    for (let i = 0; i < node.media_urls.length; i++) {
+    // Filtrar solo URLs válidas para no tronar con yCloud
+    const urlsValidas = node.media_urls.filter((u: any) => esUrlValida(u));
+    if (urlsValidas.length === 0) {
+      console.warn(`Nodo ${node.node_key}: media_urls sin URLs válidas, saltando imágenes`);
+    }
+    for (let i = 0; i < urlsValidas.length; i++) {
       const caption = i === 0 ? (node.content || "") : "";
-      await sendImage(phone, node.media_urls[i], from, apiKey, caption, node.node_key);
-      if (i < node.media_urls.length - 1) await new Promise(r => setTimeout(r, 800));
+      await sendImage(phone, urlsValidas[i].trim(), from, apiKey, caption, node.node_key);
+      if (i < urlsValidas.length - 1) await new Promise(r => setTimeout(r, 800));
     }
     if (node.options?.length) {
       await sendButtons(phone, "Elige una opción:", node.options, from, apiKey, node.node_key);
@@ -404,13 +481,22 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
     return;
   }
 
-  if (node.media_url) {
-    await sendImage(phone, node.media_url, from, apiKey, node.content || "", node.node_key);
+  if (esUrlValida(node.media_url)) {
+    await sendImage(phone, node.media_url.trim(), from, apiKey, node.content || "", node.node_key);
     if (node.options?.length) {
       await sendButtons(phone, "Elige una opción:", node.options, from, apiKey, node.node_key);
     } else if (autoAdvance) {
       await autoAdvanceNode(phone, node, cfg);
     }
+    return;
+  }
+
+  // Si el nodo era de tipo media pero la URL no es válida, igual avanza el flujo
+  // para que el candidato no se quede atascado esperando una imagen que no llega
+  if (node.media_url !== undefined && node.type === "media") {
+    console.warn(`Nodo ${node.node_key}: media_url inválida ("${node.media_url}"), avanzando flujo sin imagen`);
+    if (node.content) await sendText(phone, node.content, from, apiKey, node.node_key);
+    if (autoAdvance) await autoAdvanceNode(phone, node, cfg);
     return;
   }
 
@@ -523,6 +609,22 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   if (currentNode?.capture_field) {
     const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
     if (contact) {
+      // Validar que la respuesta tenga sentido para el campo que se está capturando
+      const validacion = await validarRespuesta(
+        currentNode.capture_field,
+        currentNode.content || '',
+        userMessage.trim()
+      );
+
+      if (!validacion.valido) {
+        // La respuesta no corresponde — enviar mensaje de error y quedarse en el mismo nodo
+        const mensajeError = validacion.error ||
+          `Por favor responde con tu ${currentNode.capture_field} para continuar.`;
+        await sendText(phone, mensajeError, cfg.from, cfg.apiKey, session.current_node);
+        console.log(`Respuesta inválida para [${currentNode.capture_field}]: "${userMessage}" — repitiendo pregunta`);
+        return; // No avanzar el flujo
+      }
+
       const normalizedValue = await normalizeField(currentNode.capture_field, userMessage.trim());
 
       await sb.from("contact_data").upsert(
@@ -530,7 +632,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
         { onConflict: "contact_id,field_key" }
       );
       console.log(`Captured & normalized: ${currentNode.capture_field} = "${userMessage}" → "${normalizedValue}"`);
-      await syncContactToSheet(phone); // se espera para garantizar que quede guardado antes de responder
+      await syncContactToSheet(phone);
     }
   }
 
