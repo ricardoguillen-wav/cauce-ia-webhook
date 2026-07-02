@@ -234,11 +234,99 @@ async function revisarYEnviarRecordatorios() {
 }
 
 // ============================================================
+// SEGUIMIENTO DE NO-SHOWS
+// Corre 1 vez al día a las 10am — detecta candidatos que tenían
+// entrevista ayer o antes y siguen sin ser contratados
+// ============================================================
+async function procesarNoShows() {
+  const ahora = new Date();
+  const mty = new Date(ahora.getTime() - 6 * 3600000);
+  const horaActual = `${String(mty.getUTCHours()).padStart(2,'0')}:${String(mty.getUTCMinutes()).padStart(2,'0')}`;
+  const horaRedon = redondear15(horaActual);
+  if (horaRedon !== "10:00") return 0; // Solo a las 10am
+
+  const { data: usuarios } = await sb.from("app_users")
+    .select("*").eq("is_active", true).eq("noshows_enabled", true);
+  if (!usuarios?.length) return 0;
+
+  const hoy = mty.toISOString().slice(0, 10);
+  let totalEnviados = 0;
+
+  for (const usuario of usuarios) {
+    try {
+      const assignedPhones: string[] = usuario.assigned_phones || [];
+      const esAdmin = !assignedPhones.length;
+      let flowsQuery = sb.from("flows").select("id, whatsapp_phone, ycloud_api_key, name");
+      if (!esAdmin) flowsQuery = flowsQuery.in("whatsapp_phone", assignedPhones);
+      const { data: flujos } = await flowsQuery;
+      if (!flujos?.length) continue;
+
+      const flowIds = flujos.map((f: any) => f.id);
+      const flowById: Record<string, any> = {};
+      flujos.forEach((f: any) => { flowById[f.id] = f; });
+
+      const { data: contactos } = await sb.from("contacts")
+        .select("id, phone, flow_id, status, contact_data(field_key, field_value)")
+        .in("flow_id", flowIds)
+        .eq("status", "en_proceso");
+
+      for (const c of (contactos || [])) {
+        try {
+          const datos: Record<string, string> = {};
+          (c.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
+
+          if (!datos.disponibilidad) continue;
+          const fechaCita = await interpretarFecha(datos.disponibilidad);
+          if (!fechaCita || fechaCita >= hoy) continue; // Solo si la fecha ya pasó
+
+          // Verificar que no se le haya mandado ya un mensaje de no-show hoy
+          const { data: logs } = await sb.from("message_log")
+            .select("id").eq("phone", c.phone).eq("node_key", "noshow_followup")
+            .gte("created_at", new Date(Date.now() - 24*3600000).toISOString())
+            .limit(1)._get();
+          if (logs?.length) continue; // Ya se le mandó hoy
+
+          const flow = flowById[c.flow_id];
+          if (!flow) continue;
+
+          const from   = flow.whatsapp_phone;
+          const apiKey = flow.ycloud_api_key || YCLOUD_KEY_FALLBACK;
+          const plantilla = usuario.noshows_msg ||
+            "Hola {{nombre}}, notamos que no pudiste asistir el {{disponibilidad}}. Seguimos con vacantes de {{puesto}} disponibles. Te esperamos cuando puedas.";
+
+          const mensaje = aplicarVariables(plantilla, {
+            nombre: datos.nombre || "Candidato",
+            puesto: datos.puesto || "el puesto",
+            disponibilidad: datos.disponibilidad,
+          });
+
+          const resultado = await sendText(c.phone, mensaje, from, apiKey);
+          await sb.from("message_log").insert({
+            phone: c.phone, direction: "out", content: mensaje, node_key: "noshow_followup",
+            status: resultado.ok ? "sent" : "failed",
+            error_detail: resultado.ok ? null : resultado.detail?.slice(0, 500),
+          });
+
+          totalEnviados++;
+          await new Promise(r => setTimeout(r, 500));
+        } catch(e) {
+          console.error(`Error en no-show para ${c.phone}:`, e);
+        }
+      }
+    } catch(e) {
+      console.error(`Error procesando no-shows para ${usuario.username}:`, e);
+    }
+  }
+  return totalEnviados;
+}
+
+// ============================================================
 // CRON — corre cada 15 minutos y decide por usuario si toca enviar
 // ============================================================
 Deno.cron("revisar-recordatorios", "*/15 * * * *", async () => {
   console.log("CRON ejecutándose...", new Date().toISOString());
   await revisarYEnviarRecordatorios();
+  await procesarNoShows();
 });
 
 // ============================================================
