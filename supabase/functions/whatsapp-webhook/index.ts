@@ -459,9 +459,8 @@ async function handleRestart(phone: string, flowId: string, restartNode: any, cf
     await sb.from("contacts").update({ status: "nuevo", updated_at: new Date().toISOString() }).eq("phone", phone);
   }
   await sb.from("sessions").delete().eq("phone", phone);
-  // Limpiar el flag de post-registro para que al reiniciar vuelva a funcionar
-  await sb.from("message_log").delete().eq("phone", phone).eq("node_key", "post_registro_out");
-
+  // Resetear el flag post_notified para que la notificación única vuelva a funcionar
+  await sb.from("contacts").update({ post_notified: false }).eq("phone", phone);
   // 3. Encontrar el nodo destino:
   //    - Si el nodo restart tiene restart_node_key configurado → usar ese nodo
   //    - Si no → usar el nodo inicial del flujo (is_start)
@@ -669,28 +668,22 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     if (contactoExistente && estatusFinalizados.includes(contactoExistente.status)) {
       const cfgExistente = await getFlowConfig(contactoExistente.flow_id, toPhone);
 
-      // Verificar si ya se envió antes el mensaje de "registro completo"
-      // Si ya se envió, solo registrar el mensaje entrante y no responder nada
-      const { data: yaRespondio } = await sb.from("message_log")
-        .select("id").eq("phone", phone).eq("node_key", "post_registro_out")
-        .limit(1).maybeSingle();
-
-      if (!yaRespondio) {
-        // Primera vez que escribe después de terminar — responder una sola vez
-        const textoRespuesta = "Hola de nuevo! Tu registro ya quedo completo anteriormente. En breve alguien de nuestro equipo se pondra en contacto contigo.\n\nSi necesitas avisarnos algo en especifico sobre tu proceso, puedes escribirlo aqui y lo revisamos.";
-        await sendText(phone, textoRespuesta, cfgExistente.from, cfgExistente.apiKey);
-        await sb.from("message_log").insert({
-          phone, direction: "out", content: textoRespuesta, node_key: "post_registro_out", status: "sent",
-        });
-      } else {
-        // Ya respondimos antes — solo registrar silenciosamente el mensaje entrante
-        console.log(`Mensaje post-registro ignorado para ${phone} (ya se notificó antes)`);
-      }
-
       // Siempre registrar el mensaje entrante
       await sb.from("message_log").insert({
         phone, direction: "in", content: userMessage, node_key: "post_registro",
       });
+
+      // Solo responder UNA vez (flag post_notified en el contacto)
+      // Si ya está marcado, ignorar silenciosamente sin responder
+      if (!contactoExistente.post_notified) {
+        const textoRespuesta = "Hola de nuevo! Tu registro ya quedo completo anteriormente. En breve alguien de nuestro equipo se pondra en contacto contigo.\n\nSi necesitas avisarnos algo en especifico sobre tu proceso, puedes escribirlo aqui y lo revisamos.";
+        await sendText(phone, textoRespuesta, cfgExistente.from, cfgExistente.apiKey, "post_registro_out");
+        // Marcar como notificado — a partir de aquí nunca más se vuelve a responder
+        await sb.from("contacts").update({ post_notified: true }).eq("phone", phone);
+        console.log(`Post-registro enviado a ${phone} — marcado como notificado`);
+      } else {
+        console.log(`Post-registro IGNORADO para ${phone} — ya fue notificado anteriormente`);
+      }
       return;
     }
 
