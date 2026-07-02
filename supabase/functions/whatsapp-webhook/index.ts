@@ -73,32 +73,26 @@ async function validarRespuesta(
   respuesta: string
 ): Promise<{ valido: boolean; error: string }> {
 
-  // Solo validar el campo "nombre" — para el resto cualquier respuesta es válida
-  // (la gente tiene faltas de ortografía en municipios, puestos, etc. y no hay que bloquearlos)
-  if (fieldKey.toLowerCase() !== "nombre") {
-    return { valido: true, error: "" };
-  }
-
   const prompt = `Eres un asistente que valida respuestas en un chatbot de reclutamiento en México.
 
 La pregunta fue: "${pregunta}"
+Campo que se quiere capturar: "${fieldKey}"
 Respuesta del candidato: "${respuesta}"
 
-¿La respuesta es un nombre de persona real (o intento de escribir un nombre)?
+¿La respuesta tiene sentido para lo que se preguntó?
 
-Respuestas INVÁLIDAS (el candidato no está dando su nombre):
-- Saludos: "buenos días", "hola", "buenas", "qué tal", "buen día"
-- Preguntas: "¿cuánto pagan?", "¿dónde queda?", "¿qué se necesita?"
-- Respuestas cortas sin sentido: "ok", "sí", "no", "va", "dale"
-- Números solos: "123", "5", "18"
+Respuestas claramente INVÁLIDAS:
+- Saludos en lugar del dato ("buenos días", "hola", "buenas", "qué tal")
+- Preguntas en lugar del dato ("¿cuánto pagan?", "¿dónde queda?")
+- Respuestas fuera de contexto ("ok", "sí", "no", "gracias", "va") cuando se espera información
+- Números solos cuando se espera un nombre
 
-Respuestas VÁLIDAS (aunque tengan errores ortográficos o sean solo nombre de pila):
-- "Ricardo", "juan", "maria", "Jose Luis", "pedro gomez", "ana karen"
+Cualquier intento de dar el dato pedido es VÁLIDO, aunque tenga errores de ortografía.
 
 Responde ÚNICAMENTE con JSON sin texto ni bloques de código:
 {"valido": true, "error": ""}
 o
-{"valido": false, "error": "Necesito tu nombre completo para continuar. ¿Me lo puedes compartir?"}`;
+{"valido": false, "error": "mensaje corto y amable en español pidiendo que responda con el dato"}`;
 
   try {
     const res = await fetch(DEEPSEEK_URL, {
@@ -465,6 +459,8 @@ async function handleRestart(phone: string, flowId: string, restartNode: any, cf
     await sb.from("contacts").update({ status: "nuevo", updated_at: new Date().toISOString() }).eq("phone", phone);
   }
   await sb.from("sessions").delete().eq("phone", phone);
+  // Limpiar el flag de post-registro para que al reiniciar vuelva a funcionar
+  await sb.from("message_log").delete().eq("phone", phone).eq("node_key", "post_registro_out");
 
   // 3. Encontrar el nodo destino:
   //    - Si el nodo restart tiene restart_node_key configurado → usar ese nodo
@@ -672,11 +668,26 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     const estatusFinalizados = ["en_proceso", "contratado", "rechazado", "descartado", "no_responde"];
     if (contactoExistente && estatusFinalizados.includes(contactoExistente.status)) {
       const cfgExistente = await getFlowConfig(contactoExistente.flow_id, toPhone);
-      await sendText(
-        phone,
-        "Hola de nuevo! Tu registro ya quedo completo anteriormente. En breve alguien de nuestro equipo se pondra en contacto contigo.\n\nSi necesitas avisarnos algo en especifico sobre tu proceso, puedes escribirlo aqui y lo revisamos.",
-        cfgExistente.from, cfgExistente.apiKey
-      );
+
+      // Verificar si ya se envió antes el mensaje de "registro completo"
+      // Si ya se envió, solo registrar el mensaje entrante y no responder nada
+      const { data: yaRespondio } = await sb.from("message_log")
+        .select("id").eq("phone", phone).eq("node_key", "post_registro_out")
+        .limit(1).maybeSingle();
+
+      if (!yaRespondio) {
+        // Primera vez que escribe después de terminar — responder una sola vez
+        const textoRespuesta = "Hola de nuevo! Tu registro ya quedo completo anteriormente. En breve alguien de nuestro equipo se pondra en contacto contigo.\n\nSi necesitas avisarnos algo en especifico sobre tu proceso, puedes escribirlo aqui y lo revisamos.";
+        await sendText(phone, textoRespuesta, cfgExistente.from, cfgExistente.apiKey);
+        await sb.from("message_log").insert({
+          phone, direction: "out", content: textoRespuesta, node_key: "post_registro_out", status: "sent",
+        });
+      } else {
+        // Ya respondimos antes — solo registrar silenciosamente el mensaje entrante
+        console.log(`Mensaje post-registro ignorado para ${phone} (ya se notificó antes)`);
+      }
+
+      // Siempre registrar el mensaje entrante
       await sb.from("message_log").insert({
         phone, direction: "in", content: userMessage, node_key: "post_registro",
       });
@@ -750,20 +761,22 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   if (currentNode?.capture_field) {
     const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
     if (contact) {
-      // Validar que la respuesta tenga sentido para el campo que se está capturando
-      const validacion = await validarRespuesta(
-        currentNode.capture_field,
-        currentNode.content || '',
-        userMessage.trim()
-      );
+      // Solo validar con DeepSeek si el nodo tiene capture_strict = true
+      // Si es libre (capture_strict = false o no definido), acepta cualquier respuesta
+      if (currentNode.capture_strict) {
+        const validacion = await validarRespuesta(
+          currentNode.capture_field,
+          currentNode.content || '',
+          userMessage.trim()
+        );
 
-      if (!validacion.valido) {
-        // La respuesta no corresponde — enviar mensaje de error y quedarse en el mismo nodo
-        const mensajeError = validacion.error ||
-          `Por favor responde con tu ${currentNode.capture_field} para continuar.`;
-        await sendText(phone, mensajeError, cfg.from, cfg.apiKey, session.current_node);
-        console.log(`Respuesta inválida para [${currentNode.capture_field}]: "${userMessage}" — repitiendo pregunta`);
-        return; // No avanzar el flujo
+        if (!validacion.valido) {
+          const mensajeError = validacion.error ||
+            `Por favor responde con la información que te solicité para continuar.`;
+          await sendText(phone, mensajeError, cfg.from, cfg.apiKey, session.current_node);
+          console.log(`Respuesta inválida [${currentNode.capture_field}] (estricto): "${userMessage}" — repitiendo pregunta`);
+          return;
+        }
       }
 
       const normalizedValue = await normalizeField(currentNode.capture_field, userMessage.trim());
@@ -772,7 +785,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
         { contact_id: contact.id, field_key: currentNode.capture_field, field_value: normalizedValue },
         { onConflict: "contact_id,field_key" }
       );
-      console.log(`Captured & normalized: ${currentNode.capture_field} = "${userMessage}" → "${normalizedValue}"`); 
+      console.log(`Captured${currentNode.capture_strict ? ' (estricto)' : ''}: ${currentNode.capture_field} = "${userMessage}" → "${normalizedValue}"`); 
     }
   }
 
