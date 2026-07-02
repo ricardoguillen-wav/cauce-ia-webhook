@@ -73,57 +73,56 @@ async function validarRespuesta(
   respuesta: string
 ): Promise<{ valido: boolean; error: string }> {
 
-  // Campos de selección con botones — el usuario no puede equivocarse
-  const camposSinValidar = ['transporte', 'area', 'puesto', 'turno_preferido', 'disponibilidad'];
-  if (camposSinValidar.includes(fieldKey.toLowerCase())) {
-    return { valido: true, error: '' };
+  // Solo validar el campo "nombre" — para el resto cualquier respuesta es válida
+  // (la gente tiene faltas de ortografía en municipios, puestos, etc. y no hay que bloquearlos)
+  if (fieldKey.toLowerCase() !== "nombre") {
+    return { valido: true, error: "" };
   }
 
   const prompt = `Eres un asistente que valida respuestas en un chatbot de reclutamiento en México.
 
-La pregunta que se le hizo al candidato fue: "${pregunta}"
-Campo que se quiere capturar: "${fieldKey}"
+La pregunta fue: "${pregunta}"
 Respuesta del candidato: "${respuesta}"
 
-Determina si la respuesta es válida para esa pregunta.
+¿La respuesta es un nombre de persona real (o intento de escribir un nombre)?
 
-Ejemplos de respuestas INVÁLIDAS:
-- Saludos en lugar del dato ("buenos días", "hola", "buenas tardes", "qué tal")
-- Preguntas en lugar del dato ("¿cuánto pagan?", "¿dónde queda?", "¿qué necesito llevar?")
-- Respuestas completamente fuera de contexto ("ok", "sí", "no", "gracias")
-- Texto sin sentido o muy corto que no corresponde al campo pedido
+Respuestas INVÁLIDAS (el candidato no está dando su nombre):
+- Saludos: "buenos días", "hola", "buenas", "qué tal", "buen día"
+- Preguntas: "¿cuánto pagan?", "¿dónde queda?", "¿qué se necesita?"
+- Respuestas cortas sin sentido: "ok", "sí", "no", "va", "dale"
+- Números solos: "123", "5", "18"
 
-Ejemplos de respuestas VÁLIDAS para nombre: "Juan García", "me llamo Pedro López", "Pedro"
-Ejemplos de respuestas VÁLIDAS para municipio: "Guadalupe", "vivo en Apodaca", "San Nicolás"
+Respuestas VÁLIDAS (aunque tengan errores ortográficos o sean solo nombre de pila):
+- "Ricardo", "juan", "maria", "Jose Luis", "pedro gomez", "ana karen"
 
-Responde ÚNICAMENTE con JSON sin texto adicional ni bloques de código:
+Responde ÚNICAMENTE con JSON sin texto ni bloques de código:
 {"valido": true, "error": ""}
 o
-{"valido": false, "error": "mensaje corto y amable en español pidiendo que responda con el dato correcto"}`;
+{"valido": false, "error": "Necesito tu nombre completo para continuar. ¿Me lo puedes compartir?"}`;
 
   try {
     const res = await fetch(DEEPSEEK_URL, {
-      method: 'POST',
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_KEY}`
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${DEEPSEEK_KEY}`
       },
       body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 120,
+        model: "deepseek-chat",
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 80,
         temperature: 0
       })
     });
     const data = await res.json();
-    const content = (data?.choices?.[0]?.message?.content || '').trim();
-    const limpio = content.replace(/```json|```/g, '').trim();
+    const content = (data?.choices?.[0]?.message?.content || "").trim();
+    const limpio = content.replace(/```json|```/g, "").trim();
     const parsed = JSON.parse(limpio);
-    console.log(`validarRespuesta [${fieldKey}]: "${respuesta}" → valido=${parsed.valido}`);
-    return { valido: parsed.valido ?? true, error: parsed.error || '' };
+    console.log(`validarRespuesta [nombre]: "${respuesta}" → valido=${parsed.valido}`);
+    return { valido: parsed.valido ?? true, error: parsed.error || "" };
   } catch(e) {
-    console.error('Error validando respuesta con DeepSeek:', e);
-    return { valido: true, error: '' }; // Si falla la API, dejar pasar para no bloquear el flujo
+    console.error("Error validando nombre con DeepSeek:", e);
+    return { valido: true, error: "" }; // Si falla la API, dejar pasar
   }
 }
 
@@ -345,77 +344,102 @@ async function sheetsAppend(sheetId: string, range: string, values: any[][]): Pr
   return res.ok;
 }
 
-const CORE_COLS = ["Telefono", "Nombre", "Estatus", "Flujo", "Fecha de registro", "Ultima actualizacion"];
-
+// Convierte field_key a título legible
 function tituloCampo(key: string): string {
-  return key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, " ");
+  const titulos: Record<string, string> = {
+    nombre: "Nombre", municipio: "Municipio", puesto: "Puesto",
+    empresa: "Empresa", disponibilidad: "Disponibilidad", transporte: "Transporte",
+    area: "Area", experiencia: "Experiencia", turno_preferido: "Turno",
+    ubicacion_entrevista: "Ubicacion entrevista",
+  };
+  return titulos[key] || (key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, " "));
 }
 
-// Sincroniza UN contacto a su Google Sheet correspondiente. Nunca lanza error
-// hacia afuera — si Sheets falla, el chat debe seguir funcionando normal.
-async function syncContactToSheet(phone: string) {
-  if (!GOOGLE_SA_JSON) return; // integracion no configurada, no hacer nada
+// Obtiene los campos capturados de un flujo, en el orden aproximado del canvas (x ascendente)
+async function getFlowCaptureFields(flowId: string): Promise<string[]> {
+  const { data: nodes } = await sb.from("nodes")
+    .select("capture_field, x")
+    .eq("flow_id", flowId)
+    .not("capture_field", "is", null)
+    .order("x", { ascending: true });
+  const seen = new Set<string>();
+  const fields: string[] = [];
+  for (const n of (nodes || [])) {
+    if (n.capture_field && !seen.has(n.capture_field)) {
+      seen.add(n.capture_field); fields.push(n.capture_field);
+    }
+  }
+  return fields;
+}
+
+// Sincroniza UN contacto a su Google Sheet.
+// forceNew = true → siempre agrega nueva fila (usar en reinicio de flujo)
+// forceNew = false → actualiza fila existente si ya existe (comportamiento normal)
+async function syncContactToSheet(phone: string, forceNew: boolean = false) {
+  if (!GOOGLE_SA_JSON) return;
   try {
     const { data: contact } = await sb.from("contacts")
       .select("*, contact_data(field_key, field_value)").eq("phone", phone).maybeSingle();
     if (!contact) return;
 
-    const { data: flow } = await sb.from("flows").select("whatsapp_phone, name").eq("id", contact.flow_id).maybeSingle();
+    const { data: flow } = await sb.from("flows")
+      .select("whatsapp_phone, name").eq("id", contact.flow_id).maybeSingle();
     if (!flow?.whatsapp_phone) return;
 
     const { data: waNumber } = await sb.from("wa_numbers")
       .select("google_sheet_id").eq("phone", flow.whatsapp_phone).maybeSingle();
     const sheetId = waNumber?.google_sheet_id;
-    if (!sheetId) return; // este numero no tiene libro asignado
+    if (!sheetId) return;
 
     const datos: Record<string, string> = {};
     (contact.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
 
-    // Leer encabezado actual (fila 1)
-    const headerData = await sheetsGet(sheetId, "A1:Z1");
-    let header: string[] = headerData?.values?.[0] || [];
-    let headerNuevo = false;
+    // Columnas dinámicas: Telefono + Fecha + los campos que captura este flujo + Estatus
+    const captureFields = await getFlowCaptureFields(contact.flow_id);
+    const COLS = ["Telefono", "Fecha", ...captureFields.map(tituloCampo), "Estatus"];
 
-    if (header.length === 0) {
-      header = [...CORE_COLS];
-      headerNuevo = true;
+    // Asegurar encabezado (si la hoja es nueva o cambió el flujo)
+    const headerData = await sheetsGet(sheetId, `A1:${String.fromCharCode(65 + COLS.length - 1)}1`);
+    const headerActual = headerData?.values?.[0] || [];
+    if (JSON.stringify(headerActual) !== JSON.stringify(COLS)) {
+      await sheetsUpdate(sheetId, "A1", [COLS]);
     }
 
-    // Agregar columnas nuevas si aparecen campos que el encabezado no contempla
-    for (const key of Object.keys(datos)) {
-      const colName = tituloCampo(key);
-      if (!header.includes(colName)) { header.push(colName); headerNuevo = true; }
-    }
+    // Construir la fila
+    const fecha = new Date(contact.created_at || Date.now()).toLocaleDateString("es-MX");
+    const row = [
+      String(phone),
+      fecha,
+      ...captureFields.map(f => datos[f] || ""),
+      contact.status || "nuevo",
+    ];
 
-    if (headerNuevo) await sheetsUpdate(sheetId, "A1", [header]);
-
-    // Construir la fila en el mismo orden que el encabezado
-    const row = header.map((col) => {
-      if (col === "Telefono") return phone;
-      if (col === "Nombre") return datos["nombre"] || "";
-      if (col === "Estatus") return contact.status || "";
-      if (col === "Flujo") return flow.name || "";
-      if (col === "Fecha de registro") return contact.created_at || "";
-      if (col === "Ultima actualizacion") return new Date().toISOString();
-      const key = col.toLowerCase().replace(/ /g, "_");
-      return datos[key] ?? "";
-    });
-
-    // Buscar si el contacto ya tiene fila (columna A = telefono)
-    const colA = await sheetsGet(sheetId, "A2:A2000");
-    const existentes: string[] = (colA?.values || []).map((r: any) => r[0]);
-    const idx = existentes.indexOf(phone);
-
-    if (idx >= 0) {
-      const rowNumber = idx + 2;
-      await sheetsUpdate(sheetId, `A${rowNumber}`, [row]);
-    } else {
+    if (forceNew) {
+      // Reinicio: siempre agregar nueva fila con la fecha actual
+      row[1] = new Date().toLocaleDateString("es-MX");
       await sheetsAppend(sheetId, "A1", [row]);
+      console.log(`Sheets: nueva fila (reinicio) para ${phone}`);
+    } else {
+      // Normal: buscar y actualizar o agregar
+      const colA = await sheetsGet(sheetId, "A2:A2000");
+      const existentes: string[] = (colA?.values || []).map((r: any) => String(r[0] || "").trim());
+      const phonePlain = String(phone).trim();
+      const idx = existentes.findIndex(e =>
+        e === phonePlain || e === "+" + phonePlain || "+" + e === phonePlain
+      );
+      if (idx >= 0) {
+        await sheetsUpdate(sheetId, `A${idx + 2}`, [row]);
+        console.log(`Sheets: actualizada fila ${idx + 2} para ${phone}`);
+      } else {
+        await sheetsAppend(sheetId, "A1", [row]);
+        console.log(`Sheets: nueva fila para ${phone}`);
+      }
     }
   } catch(e) {
     console.error("Error sincronizando a Google Sheets:", phone, e);
   }
 }
+
 
 async function resolveVariables(text: string, phone: string): Promise<string> {
   if (!text || !text.includes("{{")) return text;
@@ -427,6 +451,57 @@ async function resolveVariables(text: string, phone: string): Promise<string> {
     resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
   });
   return resolved;
+}
+
+// ── Reiniciar flujo desde el nodo que el usuario asignó ──
+async function handleRestart(phone: string, flowId: string, restartNode: any, cfg: FlowConfig) {
+  // 1. Registrar la conversación actual como nueva fila en Sheets
+  await syncContactToSheet(phone, true);
+
+  // 2. Borrar datos capturados y sesión
+  const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
+  if (contact) {
+    await sb.from("contact_data").delete().eq("contact_id", contact.id);
+    await sb.from("contacts").update({ status: "nuevo", updated_at: new Date().toISOString() }).eq("phone", phone);
+  }
+  await sb.from("sessions").delete().eq("phone", phone);
+
+  // 3. Encontrar el nodo destino:
+  //    - Si el nodo restart tiene restart_node_key configurado → usar ese nodo
+  //    - Si no → usar el nodo inicial del flujo (is_start)
+  let targetNode: any = null;
+
+  const targetKey = restartNode?.restart_node_key;
+  if (targetKey) {
+    const { data: specificNode } = await sb.from("nodes").select("*")
+      .eq("flow_id", flowId).eq("node_key", targetKey).maybeSingle();
+    targetNode = specificNode;
+  }
+
+  if (!targetNode) {
+    const { data: startNode } = await sb.from("nodes").select("*")
+      .eq("flow_id", flowId).eq("is_start", true).maybeSingle();
+    targetNode = startNode;
+  }
+
+  if (!targetNode) {
+    const { data: fallback } = await sb.from("nodes").select("*")
+      .eq("flow_id", flowId).order("created_at", { ascending: true }).limit(1).maybeSingle();
+    targetNode = fallback;
+  }
+
+  if (!targetNode) { console.log("No se encontró nodo para reinicio"); return; }
+
+  // 4. Crear nueva sesión desde ese nodo
+  await sb.from("sessions").insert({
+    phone, flow_id: flowId, current_node: targetNode.node_key,
+    updated_at: new Date().toISOString(),
+  });
+
+  // 5. Ejecutar el nodo destino
+  const nodeToSend = { ...targetNode, content: await resolveVariables(targetNode.content, phone) };
+  await executeNode(phone, nodeToSend, cfg);
+  console.log(`Flujo reiniciado para ${phone} desde nodo: ${targetNode.node_key}`);
 }
 
 async function autoAdvanceNode(phone: string, node: any, cfg: FlowConfig) {
@@ -450,6 +525,10 @@ async function autoAdvanceNode(phone: string, node: any, cfg: FlowConfig) {
     await sb.from("sessions").delete().eq("phone", phone);
     await sb.from("contacts").update({ status: "en_proceso", updated_at: new Date().toISOString() }).eq("phone", phone);
     await syncContactToSheet(phone);
+  }
+
+  if (nextNode.type === "restart") {
+    await handleRestart(phone, session.flow_id, nextNode, cfg);
   }
 }
 
@@ -529,6 +608,33 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
 // ============================================================
 // PROCESO PRINCIPAL
 // ============================================================
+// ── Notificación WhatsApp cuando llega candidato nuevo ──
+async function notificarCandidatoNuevo(candidatoPhone: string, waPhone: string, apiKey: string) {
+  // Buscar usuarios que tienen este número asignado y tienen notify_phone configurado
+  const { data: usuarios } = await sb.from("app_users")
+    .select("notify_phone, full_name")
+    .eq("is_active", true);
+
+  const yaNotificados = new Set<string>();
+  for (const u of (usuarios || [])) {
+    const phones: string[] = u.assigned_phones || [];
+    const esAdmin = !phones.length; // admin ve todos
+    const tieneNumero = esAdmin || phones.some((p: string) =>
+      p === waPhone || p === waPhone.replace(/^\+/, '') || '+' + p === waPhone
+    );
+    if (!tieneNumero || !u.notify_phone) continue;
+    if (yaNotificados.has(u.notify_phone)) continue;
+    yaNotificados.add(u.notify_phone);
+
+    const msg = `Nuevo candidato en tu flujo.\n\nNúmero: ${candidatoPhone}\nHora: ${new Date().toLocaleString('es-MX', { timeZone: 'America/Monterrey' })}`;
+    await fetch(YCLOUD_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
+      body: JSON.stringify({ from: waPhone, to: u.notify_phone, type: "text", text: { body: msg } })
+    }).catch(e => console.error("Error notificando a", u.notify_phone, e));
+  }
+}
+
 async function processMessage(phone: string, userMessage: string, toPhone: string) {
   console.log("processMessage — phone:", phone, "msg:", userMessage, "to:", toPhone);
 
@@ -536,16 +642,23 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   const toPhoneNorm  = toPhone.startsWith('+') ? toPhone : '+' + toPhone;
   const toPhonePlain = toPhone.replace(/^\+/, '');
 
-  // Buscar sesión filtrando también por to_phone — así dos números distintos
-  // nunca comparten sesión aunque el mismo candidato les haya escrito a ambos.
-  let { data: session } = await sb.from("sessions").select("*")
-    .eq("phone", phone).eq("to_phone", toPhoneNorm).maybeSingle();
+  // Buscar sesión por phone — si existe, verificar que sea del mismo número de WA
+  // para no mezclar flujos de números distintos
+  const { data: sessionRaw } = await sb.from("sessions").select("*")
+    .eq("phone", phone).maybeSingle();
 
-  if (!session) {
-    // Intentar también con formato sin "+"
-    const { data: session2 } = await sb.from("sessions").select("*")
-      .eq("phone", phone).eq("to_phone", toPhonePlain).maybeSingle();
-    session = session2;
+  // Aceptar la sesión solo si corresponde al mismo número de WA que recibió el mensaje
+  let session: any = null;
+  if (sessionRaw) {
+    const sToPhone = sessionRaw.to_phone || "";
+    const mismoNumero = !sToPhone                         // sesión vieja sin to_phone: aceptar
+      || sToPhone === toPhoneNorm
+      || sToPhone === toPhonePlain;
+    if (mismoNumero) {
+      session = sessionRaw;
+    } else {
+      console.log(`Sesión de ${phone} pertenece a ${sToPhone}, no a ${toPhone} — ignorando sesión`);
+    }
   }
 
   console.log("session:", JSON.stringify(session));
@@ -608,12 +721,16 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       { phone, flow_id: flow.id, status: "nuevo", updated_at: new Date().toISOString() },
       { onConflict: "phone" }
     );
-    // Guardar to_phone en la sesión para aislar conversaciones por número
+    // Guardar sesión — usar onConflict "phone" (el índice que ya existe en la BD)
     await sb.from("sessions").upsert(
       { phone, to_phone: toPhoneNorm, flow_id: flow.id, current_node: firstNode.node_key, updated_at: new Date().toISOString() },
-      { onConflict: "phone,to_phone" }
+      { onConflict: "phone" }
     );
-    await syncContactToSheet(phone); // se espera para garantizar que quede guardado antes de responder
+
+    // Notificar al reclutador dueño de este número cuando llega candidato nuevo
+    notificarCandidatoNuevo(phone, flow.whatsapp_phone, flow.ycloud_api_key || YCLOUD_KEY_FALLBACK).catch(e =>
+      console.error("Error enviando notificación:", e)
+    );
 
     const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone) };
     await executeNode(phone, nodeToSend, cfg);
@@ -655,8 +772,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
         { contact_id: contact.id, field_key: currentNode.capture_field, field_value: normalizedValue },
         { onConflict: "contact_id,field_key" }
       );
-      console.log(`Captured & normalized: ${currentNode.capture_field} = "${userMessage}" → "${normalizedValue}"`);
-      await syncContactToSheet(phone);
+      console.log(`Captured & normalized: ${currentNode.capture_field} = "${userMessage}" → "${normalizedValue}"`); 
     }
   }
 
@@ -688,11 +804,15 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   await executeNode(phone, nodeToSend, cfg);
 
   if (nextNode.type === "end") {
-    await sb.from("sessions").delete().eq("phone", phone).eq("to_phone", toPhoneNorm);
+    await sb.from("sessions").delete().eq("phone", phone);
     await sb.from("contacts").update({
       status: "en_proceso", updated_at: new Date().toISOString(),
     }).eq("phone", phone);
     await syncContactToSheet(phone);
+  }
+
+  if (nextNode.type === "restart") {
+    await handleRestart(phone, session.flow_id, nextNode, cfg);
   }
 }
 
