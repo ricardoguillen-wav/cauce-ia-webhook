@@ -435,7 +435,49 @@ async function syncContactToSheet(phone: string, forceNew: boolean = false) {
 }
 
 
-async function resolveVariables(text: string, phone: string): Promise<string> {
+async function sendCarousel(to: string, body: string, cards: any[], from: string, apiKey: string, nodeKey: string | null = null) {
+  const bodySeguro = (body || "Elige una opción:").slice(0, 1024);
+  const carouselCards = cards.slice(0, 10).map(card => {
+    const headerType = card.header_type === "video" ? "video" : "image";
+    const cardPayload: any = {
+      body: { text: (card.body || "").slice(0, 160) },
+      buttons: (card.buttons || []).slice(0, 2).map((b: any) => ({
+        type: "reply",
+        reply: { id: String(b.value || b.label).slice(0, 256), title: String(b.label).slice(0, 20) }
+      }))
+    };
+    if (esUrlValida(card.header_url)) {
+      cardPayload.header = { type: headerType, [headerType]: { link: card.header_url.trim() } };
+    }
+    return cardPayload;
+  }).filter(c => c.buttons.length > 0);
+
+  if (!carouselCards.length) {
+    // Sin tarjetas válidas — mandar como texto plano
+    await sendText(to, bodySeguro, from, apiKey, nodeKey);
+    return;
+  }
+
+  const payload = {
+    from, to, type: "interactive",
+    interactive: {
+      type: "carousel",
+      body: { text: bodySeguro },
+      action: { carousel_cards: carouselCards }
+    }
+  };
+  console.log("sendCarousel payload:", JSON.stringify(payload));
+  const res = await fetch(YCLOUD_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
+    body: JSON.stringify(payload)
+  });
+  const resText = await res.text();
+  console.log("sendCarousel response:", res.status, resText);
+  await logOutbound(to, bodySeguro, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
+}
+
+
   if (!text || !text.includes("{{")) return text;
   const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
   if (!contact) return text;
@@ -537,6 +579,14 @@ function esUrlValida(url: any): boolean {
 async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvance = true) {
   console.log("executeNode:", node.node_key, "type:", node.type);
   const { from, apiKey } = cfg;
+
+  // ── CARRUSEL ──
+  if (node.type === "carousel") {
+    const cards = node.carousel_cards || [];
+    await sendCarousel(phone, node.content || "", cards, from, apiKey, node.node_key);
+    // No auto-avanzar — esperar que el usuario toque un botón (como question)
+    return;
+  }
 
   if (node.media_urls?.length > 1) {
     // Filtrar solo URLs válidas para no tronar con yCloud
