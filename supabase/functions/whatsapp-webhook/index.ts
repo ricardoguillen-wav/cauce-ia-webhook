@@ -662,7 +662,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     // Si ya existe un contacto que completo su registro anteriormente, no reiniciar
     // el flujo desde cero — eso le borraba el estatus y lo regresaba a "nuevo".
     const { data: contactoExistente } = await sb.from("contacts")
-      .select("status, flow_id").eq("phone", phone).maybeSingle();
+      .select("status, flow_id, post_notified").eq("phone", phone).maybeSingle();
 
     const estatusFinalizados = ["en_proceso", "contratado", "rechazado", "descartado", "no_responde"];
     if (contactoExistente && estatusFinalizados.includes(contactoExistente.status)) {
