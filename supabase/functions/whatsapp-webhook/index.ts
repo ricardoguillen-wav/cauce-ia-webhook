@@ -562,6 +562,9 @@ async function autoAdvanceNode(phone: string, node: any, cfg: FlowConfig) {
     await sb.from("sessions").delete().eq("phone", phone);
     await sb.from("contacts").update({ status: "en_proceso", updated_at: new Date().toISOString() }).eq("phone", phone);
     await syncContactToSheet(phone);
+    // Notificaciones automáticas al finalizar el flujo
+    await enviarConfirmacionCandidato(phone, session.flow_id, cfg);
+    await notificarReclutadorFinFlujo(phone, session.flow_id, cfg);
   }
 
   if (nextNode.type === "restart") {
@@ -653,6 +656,99 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
 // ============================================================
 // PROCESO PRINCIPAL
 // ============================================================
+// ── Confirmación al CANDIDATO cuando termina el flujo ──
+// Envía un mensaje personalizable configurado en el flujo (dirección, nombre del asesor, etc.)
+async function enviarConfirmacionCandidato(phone: string, flowId: string, cfg: FlowConfig) {
+  try {
+    const { data: flow } = await sb.from("flows")
+      .select("interview_address, recruiter_name, confirm_msg, name")
+      .eq("id", flowId).maybeSingle();
+
+    // Solo enviar si hay al menos una dirección o un mensaje personalizado configurado
+    if (!flow?.confirm_msg && !flow?.interview_address) return;
+
+    const { data: contact } = await sb.from("contacts")
+      .select("*, contact_data(field_key, field_value)").eq("phone", phone).maybeSingle();
+    const datos: Record<string, string> = {};
+    (contact?.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
+
+    const plantillaDefault = `Hola ${datos.nombre || "candidato"}, gracias por registrarte.${
+      flow.recruiter_name ? `\n\nTu asesor asignado es *${flow.recruiter_name}*, quien se pondrá en contacto contigo pronto.` : ""
+    }${
+      flow.interview_address ? `\n\n*Dirección de la empresa:*\n${flow.interview_address}` : ""
+    }\n\nCualquier duda puedes escribirnos aquí.`;
+
+    const mensaje = flow.confirm_msg
+      ? flow.confirm_msg
+          .replace(/\{\{nombre\}\}/g, datos.nombre || "")
+          .replace(/\{\{puesto\}\}/g, datos.puesto || "")
+          .replace(/\{\{disponibilidad\}\}/g, datos.disponibilidad || "")
+          .replace(/\{\{municipio\}\}/g, datos.municipio || "")
+          .replace(/\{\{asesor\}\}/g, flow.recruiter_name || "")
+          .replace(/\{\{direccion\}\}/g, flow.interview_address || "")
+      : plantillaDefault;
+
+    await sendText(phone, mensaje, cfg.from, cfg.apiKey, "confirmacion_entrevista");
+    console.log(`Confirmación enviada a candidato ${phone}`);
+  } catch(e) {
+    console.error("Error enviando confirmación al candidato:", e);
+  }
+}
+
+// ── Resumen al RECLUTADOR cuando un candidato termina el flujo ──
+// Envía al notify_phone del reclutador un resumen con todos los datos capturados
+async function notificarReclutadorFinFlujo(phone: string, flowId: string, cfg: FlowConfig) {
+  try {
+    const { data: contact } = await sb.from("contacts")
+      .select("*, contact_data(field_key, field_value)").eq("phone", phone).maybeSingle();
+    if (!contact) return;
+
+    const datos: Record<string, string> = {};
+    (contact?.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
+
+    const { data: flow } = await sb.from("flows")
+      .select("name, whatsapp_phone").eq("id", flowId).maybeSingle();
+
+    // Buscar usuarios con este número asignado que tengan notify_phone
+    const { data: usuarios } = await sb.from("app_users")
+      .select("notify_phone, full_name, assigned_phones, role").eq("is_active", true);
+
+    const waPhone = cfg.from;
+    const yaNotificados = new Set<string>();
+
+    for (const u of (usuarios || [])) {
+      const phones: string[] = u.assigned_phones || [];
+      const esAdmin = !phones.length || u.role === "admin";
+      const tieneNumero = esAdmin || phones.some((p: string) =>
+        p === waPhone || p === waPhone.replace(/^\+/, '') || "+" + p === waPhone
+      );
+      if (!tieneNumero || !u.notify_phone) continue;
+      if (yaNotificados.has(u.notify_phone)) continue;
+      yaNotificados.add(u.notify_phone);
+
+      // Construir resumen con todos los campos capturados
+      const resumenCampos = Object.entries(datos)
+        .map(([k, v]) => `  • *${k}:* ${v}`)
+        .join("\n");
+
+      const msg = `*Candidato registrado en ${flow?.name || "un flujo"}*\n\n` +
+        `*Teléfono:* ${phone}\n` +
+        (resumenCampos ? `\n*Datos capturados:*\n${resumenCampos}\n` : "") +
+        `\n_${new Date().toLocaleString("es-MX", { timeZone: "America/Monterrey" })}_`;
+
+      await fetch(YCLOUD_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-API-Key": cfg.apiKey },
+        body: JSON.stringify({ from: cfg.from, to: u.notify_phone, type: "text", text: { body: msg } })
+      }).catch(e => console.error("Error notificando a reclutador:", e));
+
+      console.log(`Resumen de candidato enviado a reclutador ${u.notify_phone}`);
+    }
+  } catch(e) {
+    console.error("Error en notificarReclutadorFinFlujo:", e);
+  }
+}
+
 // ── Notificación WhatsApp cuando llega candidato nuevo ──
 async function notificarCandidatoNuevo(candidatoPhone: string, waPhone: string, apiKey: string) {
   // Buscar usuarios que tienen este número asignado y tienen notify_phone configurado
@@ -881,6 +977,9 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       status: "en_proceso", updated_at: new Date().toISOString(),
     }).eq("phone", phone);
     await syncContactToSheet(phone);
+    // Notificaciones automáticas al finalizar el flujo
+    await enviarConfirmacionCandidato(phone, session.flow_id, cfg);
+    await notificarReclutadorFinFlujo(phone, session.flow_id, cfg);
   }
 
   if (nextNode.type === "restart") {
