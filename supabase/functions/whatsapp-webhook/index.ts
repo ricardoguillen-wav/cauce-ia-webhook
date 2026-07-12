@@ -666,25 +666,41 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
 
     const estatusFinalizados = ["en_proceso", "contratado", "rechazado", "descartado", "no_responde"];
     if (contactoExistente && estatusFinalizados.includes(contactoExistente.status)) {
-      const cfgExistente = await getFlowConfig(contactoExistente.flow_id, toPhone);
 
-      // Siempre registrar el mensaje entrante
-      await sb.from("message_log").insert({
-        phone, direction: "in", content: userMessage, node_key: "post_registro",
-      });
-
-      // Solo responder UNA vez (flag post_notified en el contacto)
-      // Si ya está marcado, ignorar silenciosamente sin responder
-      if (!contactoExistente.post_notified) {
-        const textoRespuesta = "Hola de nuevo! Tu registro ya quedo completo anteriormente. En breve alguien de nuestro equipo se pondra en contacto contigo.\n\nSi necesitas avisarnos algo en especifico sobre tu proceso, puedes escribirlo aqui y lo revisamos.";
-        await sendText(phone, textoRespuesta, cfgExistente.from, cfgExistente.apiKey, "post_registro_out");
-        // Marcar como notificado — a partir de aquí nunca más se vuelve a responder
-        await sb.from("contacts").update({ post_notified: true }).eq("phone", phone);
-        console.log(`Post-registro enviado a ${phone} — marcado como notificado`);
-      } else {
-        console.log(`Post-registro IGNORADO para ${phone} — ya fue notificado anteriormente`);
+      // ── Verificar que el contacto existente pertenece a ESTE número de WhatsApp ──
+      // Si completó registro en otro número (otra empresa), dejarlo registrarse aquí
+      let esMismoNumero = true;
+      if (contactoExistente.flow_id) {
+        const { data: flowExistente } = await sb.from("flows")
+          .select("whatsapp_phone").eq("id", contactoExistente.flow_id).maybeSingle();
+        const waExistente = flowExistente?.whatsapp_phone || "";
+        if (waExistente) {
+          esMismoNumero = waExistente === toPhoneNorm || waExistente === toPhonePlain;
+        }
       }
-      return;
+
+      if (!esMismoNumero) {
+        // Candidato escribió a un número diferente (otra empresa) — no bloquearlo
+        console.log(`${phone} completó registro en otro número → permitiendo nuevo registro en ${toPhone}`);
+        // Continuar hacia el bloque de nuevo flujo (no hacer return)
+      } else {
+        // Mismo número — lógica de post-registro (responder una sola vez, silencio después)
+        const cfgExistente = await getFlowConfig(contactoExistente.flow_id, toPhone);
+
+        await sb.from("message_log").insert({
+          phone, direction: "in", content: userMessage, node_key: "post_registro",
+        });
+
+        if (!contactoExistente.post_notified) {
+          const textoRespuesta = "Hola de nuevo! Tu registro ya quedo completo anteriormente. En breve alguien de nuestro equipo se pondra en contacto contigo.\n\nSi necesitas avisarnos algo en especifico sobre tu proceso, puedes escribirlo aqui y lo revisamos.";
+          await sendText(phone, textoRespuesta, cfgExistente.from, cfgExistente.apiKey, "post_registro_out");
+          await sb.from("contacts").update({ post_notified: true }).eq("phone", phone);
+          console.log(`Post-registro enviado a ${phone} — marcado como notificado`);
+        } else {
+          console.log(`Post-registro IGNORADO para ${phone} — ya fue notificado anteriormente`);
+        }
+        return;
+      }
     }
 
     let { data: flow } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
