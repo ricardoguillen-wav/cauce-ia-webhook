@@ -696,53 +696,60 @@ async function enviarConfirmacionCandidato(phone: string, flowId: string, cfg: F
 }
 
 // ── Resumen al RECLUTADOR cuando un candidato termina el flujo ──
-// Envía al notify_phone del reclutador un resumen con todos los datos capturados
 async function notificarReclutadorFinFlujo(phone: string, flowId: string, cfg: FlowConfig) {
   try {
+    // Obtener configuración del flujo (incluyendo notify_phone del reclutador)
+    const { data: flow } = await sb.from("flows")
+      .select("name, notify_phone, recruiter_name")
+      .eq("id", flowId).maybeSingle();
+
+    const notifyPhones = (flow?.notify_phone || '')
+      .split(/[,\n]/)
+      .map((p: string) => p.trim())
+      .filter((p: string) => p.length > 6);
+
+    if (!notifyPhones.length) {
+      console.log(`Sin notify_phone configurado en el flujo ${flowId} — omitiendo notificación al reclutador`);
+      return;
+    }
+
+    // Obtener datos capturados del candidato
     const { data: contact } = await sb.from("contacts")
-      .select("*, contact_data(field_key, field_value)").eq("phone", phone).maybeSingle();
-    if (!contact) return;
+      .select("*, contact_data(field_key, field_value)")
+      .eq("phone", phone).maybeSingle();
 
     const datos: Record<string, string> = {};
     (contact?.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
 
-    const { data: flow } = await sb.from("flows")
-      .select("name, whatsapp_phone").eq("id", flowId).maybeSingle();
+    // Construir mensaje ordenado — primero los campos más importantes
+    const prioridad = ["nombre", "puesto", "municipio", "turno", "disponibilidad", "experiencia", "transporte"];
+    const clavesPrimero = prioridad.filter(k => datos[k]);
+    const clavesResto   = Object.keys(datos).filter(k => !prioridad.includes(k));
+    const todasLasClaves = [...clavesPrimero, ...clavesResto];
 
-    // Buscar usuarios con este número asignado que tengan notify_phone
-    const { data: usuarios } = await sb.from("app_users")
-      .select("notify_phone, full_name, assigned_phones, role").eq("is_active", true);
+    const lineas = todasLasClaves
+      .map(k => `*${k.charAt(0).toUpperCase() + k.slice(1).replace(/_/g, " ")}:* ${datos[k]}`)
+      .join("\n");
 
-    const waPhone = cfg.from;
-    const yaNotificados = new Set<string>();
+    const fecha = new Date().toLocaleString("es-MX", {
+      timeZone: "America/Monterrey", dateStyle: "short", timeStyle: "short"
+    });
 
-    for (const u of (usuarios || [])) {
-      const phones: string[] = u.assigned_phones || [];
-      const esAdmin = !phones.length || u.role === "admin";
-      const tieneNumero = esAdmin || phones.some((p: string) =>
-        p === waPhone || p === waPhone.replace(/^\+/, '') || "+" + p === waPhone
-      );
-      if (!tieneNumero || !u.notify_phone) continue;
-      if (yaNotificados.has(u.notify_phone)) continue;
-      yaNotificados.add(u.notify_phone);
+    const msg =
+      `*Nuevo candidato registrado* en ${flow?.name || "el flujo"}\n\n` +
+      `*WhatsApp:* ${phone}\n` +
+      (lineas ? `${lineas}\n` : "") +
+      `\n_${fecha}_`;
 
-      // Construir resumen con todos los campos capturados
-      const resumenCampos = Object.entries(datos)
-        .map(([k, v]) => `  • *${k}:* ${v}`)
-        .join("\n");
-
-      const msg = `*Candidato registrado en ${flow?.name || "un flujo"}*\n\n` +
-        `*Teléfono:* ${phone}\n` +
-        (resumenCampos ? `\n*Datos capturados:*\n${resumenCampos}\n` : "") +
-        `\n_${new Date().toLocaleString("es-MX", { timeZone: "America/Monterrey" })}_`;
-
-      await fetch(YCLOUD_URL, {
+    // Enviar a todos los números configurados
+    for (const notifyPhone of notifyPhones) {
+      const res = await fetch(YCLOUD_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-API-Key": cfg.apiKey },
-        body: JSON.stringify({ from: cfg.from, to: u.notify_phone, type: "text", text: { body: msg } })
-      }).catch(e => console.error("Error notificando a reclutador:", e));
-
-      console.log(`Resumen de candidato enviado a reclutador ${u.notify_phone}`);
+        body: JSON.stringify({ from: cfg.from, to: notifyPhone, type: "text", text: { body: msg } })
+      });
+      const resText = await res.text();
+      console.log(`Notificacion enviada a ${notifyPhone}: ${res.status} ${resText.slice(0,100)}`);
     }
   } catch(e) {
     console.error("Error en notificarReclutadorFinFlujo:", e);
