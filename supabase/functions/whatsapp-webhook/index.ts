@@ -900,11 +900,6 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       { onConflict: "phone" }
     );
 
-    // Notificar al reclutador dueño de este número cuando llega candidato nuevo
-    notificarCandidatoNuevo(phone, flow.whatsapp_phone, flow.ycloud_api_key || YCLOUD_KEY_FALLBACK).catch(e =>
-      console.error("Error enviando notificación:", e)
-    );
-
     const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone) };
     await executeNode(phone, nodeToSend, cfg);
     return;
