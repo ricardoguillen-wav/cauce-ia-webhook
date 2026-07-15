@@ -435,46 +435,52 @@ async function syncContactToSheet(phone: string, forceNew: boolean = false) {
 }
 
 
+// CAROUSEL — WhatsApp NO soporta carruseles en mensajes de sesión (solo en plantillas HSM aprobadas).
+// Solución: enviar las imágenes una por una con su caption, luego los botones agrupados como pregunta.
 async function sendCarousel(to: string, body: string, cards: any[], from: string, apiKey: string, nodeKey: string | null = null) {
-  const bodySeguro = (body || "Elige una opción:").slice(0, 1024);
-  const carouselCards = cards.slice(0, 10).map(card => {
-    const headerType = card.header_type === "video" ? "video" : "image";
-    const cardPayload: any = {
-      body: { text: (card.body || "").slice(0, 160) },
-      buttons: (card.buttons || []).slice(0, 2).map((b: any) => ({
-        type: "reply",
-        reply: { id: String(b.value || b.label).slice(0, 256), title: String(b.label).slice(0, 20) }
-      }))
-    };
-    if (esUrlValida(card.header_url)) {
-      cardPayload.header = { type: headerType, [headerType]: { link: card.header_url.trim() } };
-    }
-    return cardPayload;
-  }).filter(c => c.buttons.length > 0);
+  if (!cards.length) return;
 
-  if (!carouselCards.length) {
-    // Sin tarjetas válidas — mandar como texto plano
-    await sendText(to, bodySeguro, from, apiKey, nodeKey);
-    return;
+  // 1. Enviar el texto introductorio si existe
+  if (body?.trim()) {
+    await sendText(to, body.trim(), from, apiKey, nodeKey);
   }
 
-  const payload = {
-    from, to, type: "interactive",
-    interactive: {
-      type: "carousel",
-      body: { text: bodySeguro },
-      action: { carousel_cards: carouselCards }
+  // 2. Enviar cada tarjeta como imagen + caption
+  for (const card of cards) {
+    const url  = card.header_url?.trim() || "";
+    const text = card.body?.trim() || "";
+    if (url) {
+      // Imagen con texto como caption
+      await sendImage(to, url, from, apiKey, text || undefined, nodeKey);
+    } else if (text) {
+      // Sin imagen — solo texto
+      await sendText(to, text, from, apiKey, nodeKey);
     }
-  };
-  console.log("sendCarousel payload:", JSON.stringify(payload));
-  const res = await fetch(YCLOUD_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
-    body: JSON.stringify(payload)
-  });
-  const resText = await res.text();
-  console.log("sendCarousel response:", res.status, resText);
-  await logOutbound(to, bodySeguro, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
+    // Pequeña pausa para respetar el orden de entrega
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  // 3. Recopilar todos los botones únicos de todas las tarjetas
+  const botones: { label: string; value: string }[] = [];
+  const vistos = new Set<string>();
+  for (const card of cards) {
+    for (const btn of (card.buttons || [])) {
+      if (btn.value && !vistos.has(btn.value)) {
+        vistos.add(btn.value);
+        botones.push({ label: btn.label, value: btn.value });
+      }
+    }
+  }
+
+  if (!botones.length) return;
+
+  // 4. Mostrar los botones — hasta 3 como botones, más de 3 como lista
+  const prompt = "Selecciona una opcion:";
+  if (botones.length <= 3) {
+    await sendButtons(to, prompt, botones, from, apiKey, nodeKey);
+  } else {
+    await sendList(to, prompt, "Ver opciones", "Opciones", botones, from, apiKey, nodeKey);
+  }
 }
 
 
