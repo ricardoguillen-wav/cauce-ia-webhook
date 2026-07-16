@@ -330,6 +330,139 @@ Deno.cron("revisar-recordatorios", "*/15 * * * *", async () => {
 });
 
 // ============================================================
+// RESUMEN DIARIO — 7 PM Monterrey (01:00 UTC)
+// ============================================================
+async function enviarResumenDiario() {
+  console.log("Ejecutando resumen diario...", new Date().toISOString());
+
+  // Obtener todos los contactos en proceso
+  const { data: enProceso } = await sb.from("contacts")
+    .select("*, contact_data(field_key, field_value)")
+    .eq("status", "en_proceso");
+
+  if (!enProceso?.length) {
+    console.log("Sin candidatos en proceso — resumen omitido");
+    return;
+  }
+
+  // Obtener todos los flujos con notify_phone
+  const { data: allFlows } = await sb.from("flows")
+    .select("id, name, notify_phone, recruiter_name, whatsapp_phone, ycloud_api_key");
+
+  // Detectar candidatos que escribieron DESPUÉS de terminar el flujo
+  const phones = enProceso.map(c => c.phone);
+  const { data: postMensajes } = await sb.from("message_log")
+    .select("phone, content, direction, created_at")
+    .in("phone", phones)
+    .eq("node_key", "post_registro")
+    .eq("direction", "in");
+
+  const phonesConMensaje = new Set((postMensajes || []).map(m => m.phone));
+  const mensajesPorPhone: Record<string, string> = {};
+  (postMensajes || []).forEach(m => {
+    if (!mensajesPorPhone[m.phone]) mensajesPorPhone[m.phone] = m.content?.slice(0, 80) || "";
+  });
+
+  // Agrupar candidatos por notify_phone
+  const resumenPorDest: Record<string, { contactos: any[]; flow: any }> = {};
+
+  for (const c of enProceso) {
+    const flow = allFlows?.find(f => f.id === c.flow_id);
+    if (!flow) continue;
+
+    // Soportar múltiples notify_phone separados por coma/salto de línea
+    const destinos = (flow.notify_phone || "")
+      .split(/[,\n]/)
+      .map((p: string) => p.trim())
+      .filter((p: string) => p.length > 6);
+
+    for (const dest of destinos) {
+      if (!resumenPorDest[dest]) resumenPorDest[dest] = { contactos: [], flow };
+      resumenPorDest[dest].contactos.push({ c, flow });
+    }
+  }
+
+  const hoy = new Date().toLocaleDateString("es-MX", {
+    timeZone: "America/Monterrey", weekday: "long", day: "numeric", month: "long"
+  }).toUpperCase();
+
+  // Enviar un resumen a cada número destino
+  for (const [dest, { contactos, flow }] of Object.entries(resumenPorDest)) {
+    // Obtener API key y número de origen
+    const from   = flow.whatsapp_phone;
+    const apiKey = flow.ycloud_api_key || YCLOUD_KEY_FALLBACK;
+    if (!from || !apiKey) continue;
+
+    // Categorizar candidatos
+    const conDuda: any[]    = [];
+    const conCita: any[]    = [];
+    const sinCita: any[]    = [];
+
+    for (const { c, flow: f } of contactos) {
+      const datos: Record<string, string> = {};
+      (c.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
+
+      // Tiene mensaje post-registro (escribió con duda)
+      if (phonesConMensaje.has(c.phone)) {
+        conDuda.push({ c, datos, f, msg: mensajesPorPhone[c.phone] });
+      // Tiene disponibilidad/cita agendada
+      } else if (datos.disponibilidad && datos.disponibilidad.trim().length > 3) {
+        conCita.push({ c, datos, f });
+      } else {
+        sinCita.push({ c, datos, f });
+      }
+    }
+
+    // Construir el mensaje
+    let msg = `*RESUMEN DE CANDIDATOS — ${hoy}*\n`;
+    msg += `_Total en proceso: ${contactos.length}_\n`;
+
+    if (conDuda.length) {
+      msg += `\n⚠️ *Requieren atención / con preguntas:*\n`;
+      conDuda.forEach(({ c, datos, msg: pregunta }) => {
+        const nombre = datos.nombre || c.phone;
+        const num    = c.phone.replace(/^\+/, "");
+        msg += `• ${nombre}`;
+        if (pregunta) msg += ` — _"${pregunta}"_`;
+        msg += ` 📞 ${num}\n`;
+      });
+    }
+
+    if (conCita.length) {
+      msg += `\n📅 *Con cita agendada:*\n`;
+      conCita.forEach(({ c, datos, f }) => {
+        const nombre = datos.nombre || c.phone;
+        const cita   = datos.disponibilidad || "—";
+        const num    = c.phone.replace(/^\+/, "");
+        const rec    = f.recruiter_name ? ` (${f.recruiter_name})` : "";
+        msg += `• ${nombre}${rec} — ${cita} 📞 ${num}\n`;
+      });
+    }
+
+    if (sinCita.length) {
+      msg += `\n✅ *En proceso (sin cita):*\n`;
+      sinCita.forEach(({ c, datos, f }) => {
+        const nombre = datos.nombre || c.phone;
+        const num    = c.phone.replace(/^\+/, "");
+        const rec    = f.recruiter_name ? ` (${f.recruiter_name})` : "";
+        msg += `• ${nombre}${rec} 📞 ${num}\n`;
+      });
+    }
+
+    const result = await sendText(dest, msg, from, apiKey);
+    console.log(`Resumen enviado a ${dest}: ${result.ok ? "OK" : result.detail}`);
+  }
+}
+
+// Cron resumen diario — 7 PM Monterrey = 01:00 UTC
+Deno.cron("resumen-diario-7pm", "0 1 * * *", async () => {
+  console.log("Resumen diario 7 PM Monterrey...");
+  await enviarResumenDiario();
+});
+
+
+
+// ============================================================
 // HTTP — ejecutar manualmente o probar desde el panel
 // ============================================================
 Deno.serve(async (req) => {
@@ -356,6 +489,15 @@ Deno.serve(async (req) => {
       if (body?.forzar) {
         const resultado = await revisarYEnviarRecordatorios();
         return new Response(JSON.stringify({ ok: true, ...resultado }), {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+
+      // Disparar resumen diario manualmente (para pruebas)
+      if (body?.resumen_diario) {
+        await enviarResumenDiario();
+        return new Response(JSON.stringify({ ok: true, message: "Resumen diario enviado" }), {
           status: 200,
           headers: { ...corsHeaders, "Content-Type": "application/json" }
         });
