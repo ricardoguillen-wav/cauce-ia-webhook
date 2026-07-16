@@ -483,7 +483,7 @@ async function sendCarousel(to: string, body: string, cards: any[], from: string
   }
 }
 
-
+async function resolveVariables(text: string, phone: string): Promise<string> {
   if (!text || !text.includes("{{")) return text;
   const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
   if (!contact) return text;
