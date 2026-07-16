@@ -335,10 +335,15 @@ Deno.cron("revisar-recordatorios", "*/15 * * * *", async () => {
 async function enviarResumenDiario() {
   console.log("Ejecutando resumen diario...", new Date().toISOString());
 
-  // Obtener todos los contactos en proceso
+  // Obtener solo candidatos que completaron el flujo HOY (updated_at en Monterrey)
+  const ahoraMty = new Date(Date.now() - 6 * 3600 * 1000); // UTC → MTY
+  const inicioHoyMty = new Date(ahoraMty.getFullYear(), ahoraMty.getMonth(), ahoraMty.getDate());
+  const inicioHoyUTC = new Date(inicioHoyMty.getTime() + 6 * 3600 * 1000);
+
   const { data: enProceso } = await sb.from("contacts")
     .select("*, contact_data(field_key, field_value)")
-    .eq("status", "en_proceso");
+    .eq("status", "en_proceso")
+    .gte("updated_at", inicioHoyUTC.toISOString());
 
   if (!enProceso?.length) {
     console.log("Sin candidatos en proceso — resumen omitido");
@@ -415,7 +420,7 @@ async function enviarResumenDiario() {
 
     // Construir el mensaje
     let msg = `*RESUMEN DE CANDIDATOS — ${hoy}*\n`;
-    msg += `_Total en proceso: ${contactos.length}_\n`;
+    msg += `_Registrados hoy: ${contactos.length}_\n`;
 
     if (conDuda.length) {
       msg += `\n⚠️ *Requieren atención / con preguntas:*\n`;
