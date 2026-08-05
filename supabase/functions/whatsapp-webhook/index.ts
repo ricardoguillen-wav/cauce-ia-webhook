@@ -830,21 +830,12 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
         console.log(`${phone} completó registro en otro número → permitiendo nuevo registro en ${toPhone}`);
         // Continuar hacia el bloque de nuevo flujo (no hacer return)
       } else {
-        // Mismo número — lógica de post-registro (responder una sola vez, silencio después)
-        const cfgExistente = await getFlowConfig(contactoExistente.flow_id, toPhone);
-
+        // Candidato que ya terminó el flujo escribe de nuevo
+        // Solo se registra en el log, sin respuesta automática
         await sb.from("message_log").insert({
           phone, direction: "in", content: userMessage, node_key: "post_registro",
-        });
-
-        if (!contactoExistente.post_notified) {
-          const textoRespuesta = "Hola de nuevo! Tu registro ya quedo completo anteriormente. En breve alguien de nuestro equipo se pondra en contacto contigo.\n\nSi necesitas avisarnos algo en especifico sobre tu proceso, puedes escribirlo aqui y lo revisamos.";
-          await sendText(phone, textoRespuesta, cfgExistente.from, cfgExistente.apiKey, "post_registro_out");
-          await sb.from("contacts").update({ post_notified: true }).eq("phone", phone);
-          console.log(`Post-registro enviado a ${phone} — marcado como notificado`);
-        } else {
-          console.log(`Post-registro IGNORADO para ${phone} — ya fue notificado anteriormente`);
-        }
+        }).catch(() => {});
+        console.log(`[POST-REGISTRO] Mensaje de ${phone} registrado silenciosamente`);
         return;
       }
     }
@@ -904,50 +895,6 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     phone, direction: "in", content: userMessage, node_key: session.current_node,
   });
 
-  // ── DETECCIÓN DE DECLIVE ──────────────────────────────────────────
-  // Si el candidato envía un mensaje con palabras clave negativas configuradas
-  // en el flujo, se marca como "declino" automáticamente y se cierra la sesión
-  if (userMessage && userMessage.trim()) {
-    const { data: flowData } = await sb.from("flows")
-      .select("decline_keywords, decline_message")
-      .eq("id", session.flow_id).maybeSingle();
-
-    const rawKeywords = flowData?.decline_keywords;
-    const keywords: string[] = rawKeywords
-      ? (typeof rawKeywords === "string" ? JSON.parse(rawKeywords) : rawKeywords)
-      : [];
-
-    if (keywords.length > 0) {
-      const msgNorm = userMessage.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-      const matched = keywords.find(k => {
-        const kNorm = k.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-        return msgNorm.includes(kNorm);
-      });
-
-      if (matched) {
-        console.log(`[DECLINO] "${matched}" detectado en mensaje de ${phone} — marcando como declino`);
-
-        // 1. Actualizar estatus en contacts
-        await sb.from("contacts").update({
-          status: "declino",
-          notes: `Declino automático — detectado: "${matched}"`,
-          updated_at: new Date().toISOString()
-        }).eq("phone", phone);
-
-        // 2. Eliminar la sesión para no reiniciar el flujo
-        await sb.from("sessions").delete().eq("phone", phone);
-
-        // 3. Enviar mensaje de despedida personalizado o genérico
-        const msgDespedida = flowData?.decline_message ||
-          "Entendemos tu situación, gracias por avisarnos. Si en algún momento cambia algo, aquí estaremos con gusto. ¡Mucho éxito!";
-        const despedidaResolved = await resolveVariables(msgDespedida, phone);
-        await sendText(phone, despedidaResolved, cfg.from, cfg.apiKey);
-        return;
-      }
-    }
-  }
-  // ──────────────────────────────────────────────────────────────────
-
   const { data: currentNode } = await sb.from("nodes").select("*")
     .eq("flow_id", session.flow_id).eq("node_key", session.current_node).maybeSingle();
   console.log("currentNode:", JSON.stringify(currentNode));
@@ -955,31 +902,15 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   if (currentNode?.capture_field) {
     const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
     if (contact) {
-      // Solo validar con DeepSeek si el nodo tiene capture_strict = true
-      // Si es libre (capture_strict = false o no definido), acepta cualquier respuesta
-      if (currentNode.capture_strict) {
-        const validacion = await validarRespuesta(
-          currentNode.capture_field,
-          currentNode.content || '',
-          userMessage.trim()
-        );
-
-        if (!validacion.valido) {
-          const mensajeError = validacion.error ||
-            `Por favor responde con la información que te solicité para continuar.`;
-          await sendText(phone, mensajeError, cfg.from, cfg.apiKey, session.current_node);
-          console.log(`Respuesta inválida [${currentNode.capture_field}] (estricto): "${userMessage}" — repitiendo pregunta`);
-          return;
-        }
-      }
-
+      // Siempre capturar lo que el candidato escribe — sin validación de DeepSeek
+      // para evitar que respuestas válidas sean rechazadas incorrectamente
       const normalizedValue = await normalizeField(currentNode.capture_field, userMessage.trim());
 
       await sb.from("contact_data").upsert(
         { contact_id: contact.id, field_key: currentNode.capture_field, field_value: normalizedValue },
         { onConflict: "contact_id,field_key" }
       );
-      console.log(`Captured${currentNode.capture_strict ? ' (estricto)' : ''}: ${currentNode.capture_field} = "${userMessage}" → "${normalizedValue}"`); 
+      console.log(`Captured: ${currentNode.capture_field} = "${userMessage}" → "${normalizedValue}"`);
     }
   }
 
