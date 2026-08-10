@@ -902,15 +902,29 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   if (currentNode?.capture_field) {
     const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
     if (contact) {
-      // Siempre capturar lo que el candidato escribe — sin validación de DeepSeek
-      // para evitar que respuestas válidas sean rechazadas incorrectamente
-      const normalizedValue = await normalizeField(currentNode.capture_field, userMessage.trim());
+      // Si el nodo tiene capture_strict = true, validar con DeepSeek antes de guardar
+      if (currentNode.capture_strict) {
+        const validacion = await validarRespuesta(
+          currentNode.capture_field,
+          currentNode.content || '',
+          userMessage.trim()
+        );
+        if (!validacion.valido) {
+          const mensajeError = validacion.error ||
+            `Por favor responde con la información que te solicité para continuar.`;
+          await sendText(phone, mensajeError, cfg.from, cfg.apiKey, session.current_node);
+          console.log(`Capture rechazado [${currentNode.capture_field}] (strict): "${userMessage}"`);
+          return; // No guardar, no avanzar — re-pregunta
+        }
+      }
 
+      // Guardar el dato (validado o libre)
+      const normalizedValue = await normalizeField(currentNode.capture_field, userMessage.trim());
       await sb.from("contact_data").upsert(
         { contact_id: contact.id, field_key: currentNode.capture_field, field_value: normalizedValue },
         { onConflict: "contact_id,field_key" }
       );
-      console.log(`Captured: ${currentNode.capture_field} = "${userMessage}" → "${normalizedValue}"`);
+      console.log(`Captured [${currentNode.capture_field}${currentNode.capture_strict ? " strict" : ""}]: "${normalizedValue}"`);
     }
   }
 
