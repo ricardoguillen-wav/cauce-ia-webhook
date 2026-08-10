@@ -108,6 +108,18 @@ async function procesarParaUsuario(usuario: any, tipo: "noche" | "manana") {
   const { data: flows } = await flowsQuery;
   if (!flows?.length) return 0;
 
+  // Leer configuración de recordatorio por número (columnas pueden no existir aún)
+  const phonesDelUsuario = flows.map((f: any) => f.whatsapp_phone).filter(Boolean);
+  const waCfgByPhone: Record<string, any> = {};
+  try {
+    const { data: waNumbers } = await sb.from("wa_numbers")
+      .select("phone, reminder_enabled, reminder_msg_noche, reminder_msg_manana")
+      .in("phone", phonesDelUsuario);
+    (waNumbers || []).forEach((n: any) => { waCfgByPhone[n.phone] = n; });
+  } catch(e) {
+    console.log("wa_numbers sin columnas de recordatorio — usando defaults del usuario");
+  }
+
   const flowIds = flows.map((f: any) => f.id);
   const flowById: Record<string, any> = {};
   flows.forEach((f: any) => { flowById[f.id] = f; });
@@ -125,7 +137,17 @@ async function procesarParaUsuario(usuario: any, tipo: "noche" | "manana") {
     .select("id, phone, flow_id, status, bot_paused, contact_data(field_key, field_value)")
     .in("flow_id", flowIds);
 
-  if (!contactsRows?.length) return 0;
+  if (!contactsRows?.length) {
+    console.log(`Sin contactos en los flujos de ${usuario.username}`);
+    return 0;
+  }
+
+  const conDisponibilidad = contactsRows.filter(c => {
+    const datos: Record<string, string> = {};
+    (c.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
+    return !!datos.disponibilidad;
+  });
+  console.log(`Contactos totales: ${contactsRows.length} | Con disponibilidad: ${conDisponibilidad.length} | Objetivo: ${objetivoISO}`);
 
   let enviados = 0;
 
@@ -149,9 +171,15 @@ async function procesarParaUsuario(usuario: any, tipo: "noche" | "manana") {
       const from   = flow.whatsapp_phone || "+526181239810";
       const apiKey = flow.ycloud_api_key || YCLOUD_KEY_FALLBACK;
 
+      // Mensaje personalizado: primero del wa_number, luego del usuario, luego default
+      const waCfg = waCfgByPhone[from] || {};
+
+      // Si el número tiene recordatorios desactivados, saltar
+      if (waCfg.reminder_enabled === false) continue;
+
       const plantilla = tipo === "noche"
-        ? (usuario.reminder_msg_noche || DEFAULT_MSG_NOCHE)
-        : (usuario.reminder_msg_manana || DEFAULT_MSG_MANANA);
+        ? (waCfg.reminder_msg_noche || usuario.reminder_msg_noche || DEFAULT_MSG_NOCHE)
+        : (waCfg.reminder_msg_manana || usuario.reminder_msg_manana || DEFAULT_MSG_MANANA);
 
       const mensaje = aplicarVariables(plantilla, {
         nombre: datos.nombre || "Candidato",
