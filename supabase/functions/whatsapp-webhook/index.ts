@@ -67,6 +67,133 @@ async function normalizeField(fieldKey: string, rawValue: string): Promise<strin
 // Si el candidato pone "buenos días" cuando se le pregunta el nombre,
 // el bot le pide que responda correctamente sin avanzar en el flujo.
 // ============================================================
+// ============================================================
+// VALIDACIÓN LOCAL POR REGLAS — no depende de ninguna API
+// Se ejecuta SIEMPRE antes de DeepSeek. Si esto rechaza, se rechaza.
+// ============================================================
+function limpiarTexto(s: string): string {
+  return s.toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+// Frases que nunca son un dato válido, sin importar el campo
+const BASURA_GENERAL = [
+  "hola", "holaa", "ola", "buenas", "buenos dias", "buen dia", "buenas tardes",
+  "buenas noches", "que tal", "qué tal", "saludos", "hey", "ey",
+  "si", "sí", "no", "ok", "okay", "oki", "va", "sale", "listo", "bien",
+  "gracias", "grax", "de nada", "aja", "ajá", "mmm", "eso", "claro",
+  "por favor", "porfa", "me interesa", "interesado", "interesada",
+  "info", "informacion", "información", "quiero info", "mas info",
+  "?", "??", "...", "x", "xd", "jaja", "jajaja"
+];
+
+function validarLocal(
+  fieldKey: string,
+  respuesta: string,
+  node: any
+): { valido: boolean; error: string } {
+  const raw   = (respuesta || "").trim();
+  const texto = limpiarTexto(raw);
+
+  if (!texto) {
+    return { valido: false, error: "No recibí tu respuesta. ¿Me la puedes escribir por favor?" };
+  }
+
+  // 1. Si el nodo tiene opciones (pregunta / lista), la respuesta DEBE ser una de ellas
+  const opciones = node?.options;
+  if (Array.isArray(opciones) && opciones.length > 0) {
+    const coincide = opciones.some((o: any) =>
+      limpiarTexto(String(o.value ?? "")) === texto ||
+      limpiarTexto(String(o.label ?? "")) === texto
+    );
+    if (!coincide) {
+      const lista = opciones.map((o: any) => `• ${o.label}`).join("\n");
+      return {
+        valido: false,
+        error: `Por favor selecciona una de las opciones del menú:\n\n${lista}`
+      };
+    }
+    return { valido: true, error: "" };
+  }
+
+  // 2. Basura general — saludos, monosílabos, agradecimientos
+  if (BASURA_GENERAL.includes(texto)) {
+    return {
+      valido: false,
+      error: `Disculpa, no alcancé a registrar el dato. ¿Me lo puedes escribir por favor?`
+    };
+  }
+
+  // 3. Reglas por tipo de campo
+  const key = limpiarTexto(fieldKey);
+
+  // NOMBRE — mínimo 3 letras, sin puros números
+  if (key.includes("nombre")) {
+    if (raw.length < 3)              return { valido: false, error: "Por favor escríbeme tu *nombre completo* 😊" };
+    if (/^\d+$/.test(raw))           return { valido: false, error: "Necesito tu *nombre*, no un número. ¿Me lo compartes? 😊" };
+    if (!/[a-záéíóúñ]{2,}/i.test(raw)) return { valido: false, error: "Por favor escríbeme tu *nombre completo* 😊" };
+    return { valido: true, error: "" };
+  }
+
+  // MUNICIPIO / COLONIA / CIUDAD — mínimo 3 letras, no puros números
+  if (key.includes("municipio") || key.includes("ciudad") || key.includes("colonia") || key.includes("domicilio") || key.includes("ubicacion")) {
+    if (raw.length < 3)              return { valido: false, error: "¿En qué *municipio o colonia* vives? 📍" };
+    if (/^\d+$/.test(raw))           return { valido: false, error: "Necesito el nombre del *municipio o colonia*, no un número 📍" };
+    if (!/[a-záéíóúñ]{3,}/i.test(raw)) return { valido: false, error: "¿En qué *municipio o colonia* vives? 📍" };
+    return { valido: true, error: "" };
+  }
+
+  // DISPONIBILIDAD / FECHA DE CITA — debe traer día, mes u hora
+  if (key.includes("disponibilidad") || key.includes("fecha") || key.includes("cita") || key.includes("dia")) {
+    const tieneDia = /(lunes|martes|miercoles|jueves|viernes|sabado|domingo|hoy|manana|mañana|pasado)/i.test(texto);
+    const tieneMes = /(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)/i.test(texto);
+    const tieneNum = /\d{1,2}/.test(raw);
+    const tieneHora= /(\d{1,2}\s*(am|pm|hrs|horas|:\d{2}))/i.test(texto);
+    if (!tieneDia && !tieneMes && !tieneNum && !tieneHora) {
+      return {
+        valido: false,
+        error: "¿Qué *día y hora* te queda mejor? 📅\n_Ejemplo: lunes 21 a las 9am_"
+      };
+    }
+    if (raw.length < 3) {
+      return { valido: false, error: "¿Qué *día y hora* te queda mejor? 📅\n_Ejemplo: lunes 21 a las 9am_" };
+    }
+    return { valido: true, error: "" };
+  }
+
+  // PUESTO / VACANTE (texto libre) — mínimo 3 letras
+  if (key.includes("puesto") || key.includes("vacante")) {
+    if (raw.length < 3 || !/[a-záéíóúñ]{3,}/i.test(raw)) {
+      return { valido: false, error: "¿Qué *puesto* te interesa? 💼" };
+    }
+    return { valido: true, error: "" };
+  }
+
+  // TELÉFONO — mínimo 10 dígitos
+  if (key.includes("telefono") || key.includes("celular") || key.includes("whatsapp")) {
+    const digitos = raw.replace(/\D/g, "");
+    if (digitos.length < 10) {
+      return { valido: false, error: "Por favor escríbeme tu número a *10 dígitos* 📱" };
+    }
+    return { valido: true, error: "" };
+  }
+
+  // EDAD — número entre 16 y 75
+  if (key.includes("edad")) {
+    const n = parseInt(raw.replace(/\D/g, ""), 10);
+    if (isNaN(n) || n < 16 || n > 75) {
+      return { valido: false, error: "¿Cuántos *años* tienes? Escríbelo solo con números 🙂" };
+    }
+    return { valido: true, error: "" };
+  }
+
+  // Genérico — al menos 2 caracteres con alguna letra o número
+  if (raw.length < 2) {
+    return { valido: false, error: "Disculpa, ¿me puedes escribir el dato completo? 😊" };
+  }
+
+  return { valido: true, error: "" };
+}
+
 async function validarRespuesta(
   fieldKey: string,
   pregunta: string,
@@ -115,8 +242,9 @@ o
     console.log(`validarRespuesta [nombre]: "${respuesta}" → valido=${parsed.valido}`);
     return { valido: parsed.valido ?? true, error: parsed.error || "" };
   } catch(e) {
-    console.error("Error validando nombre con DeepSeek:", e);
-    return { valido: true, error: "" }; // Si falla la API, dejar pasar
+    console.error(`[DEEPSEEK-FALLO] No se pudo validar "${fieldKey}" — revisa DEEPSEEK_KEY o saldo. Detalle:`, e);
+    // La validación local ya se ejecutó antes, así que aquí se deja pasar sin riesgo
+    return { valido: true, error: "" };
   }
 }
 
@@ -902,8 +1030,16 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   if (currentNode?.capture_field) {
     const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
     if (contact) {
-      // Si el nodo tiene capture_strict = true, validar con DeepSeek antes de guardar
       if (currentNode.capture_strict) {
+        // PASO 1 — Validación local por reglas (siempre funciona, sin depender de APIs)
+        const local = validarLocal(currentNode.capture_field, userMessage.trim(), currentNode);
+        if (!local.valido) {
+          await sendText(phone, local.error, cfg.from, cfg.apiKey, session.current_node);
+          console.log(`[STRICT-LOCAL] Rechazado [${currentNode.capture_field}]: "${userMessage}"`);
+          return; // No guardar, no avanzar — re-pregunta
+        }
+
+        // PASO 2 — Validación con DeepSeek (capa extra). Si la API falla, ya pasó la local.
         const validacion = await validarRespuesta(
           currentNode.capture_field,
           currentNode.content || '',
@@ -911,10 +1047,10 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
         );
         if (!validacion.valido) {
           const mensajeError = validacion.error ||
-            `Por favor responde con la información que te solicité para continuar.`;
+            `Disculpa, no alcancé a registrar el dato. ¿Me lo puedes escribir por favor?`;
           await sendText(phone, mensajeError, cfg.from, cfg.apiKey, session.current_node);
-          console.log(`Capture rechazado [${currentNode.capture_field}] (strict): "${userMessage}"`);
-          return; // No guardar, no avanzar — re-pregunta
+          console.log(`[STRICT-IA] Rechazado [${currentNode.capture_field}]: "${userMessage}"`);
+          return;
         }
       }
 
