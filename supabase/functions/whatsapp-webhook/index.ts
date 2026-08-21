@@ -284,14 +284,50 @@ async function getFlowConfig(flowId: string, toPhoneFallback: string = ""): Prom
 }
 
 // ============================================================
+// TYPING INDICATOR — marca el mensaje como leído (doble check azul)
+// y muestra "escribiendo..." mientras preparamos la respuesta.
+// El indicador se quita solo al responder, o a los 25 segundos.
+// ============================================================
+async function marcarLeidoYEscribiendo(inboundId: string, apiKey: string) {
+  if (!inboundId || !apiKey) return;
+  try {
+    const res = await fetch(
+      `https://api.ycloud.com/v2/whatsapp/inboundMessages/${encodeURIComponent(inboundId)}/typing`,
+      { method: "POST", headers: { "Content-Type": "application/json", "X-API-Key": apiKey } }
+    );
+    if (!res.ok) {
+      const t = await res.text();
+      console.log(`[TYPING] ${res.status}: ${t.slice(0, 120)}`);
+    } else {
+      console.log(`[TYPING] escribiendo... mostrado para ${inboundId}`);
+    }
+  } catch (e) {
+    // Nunca debe romper el flujo — es solo cosmético
+    console.log("[TYPING] error ignorado:", e);
+  }
+}
+
+// ============================================================
 // YCLOUD — Envío de mensajes (cada llamada usa la API key de SU flujo)
 // ============================================================
 // Registra cada intento de envío saliente, con su estatus real (enviado/fallido)
 async function logOutbound(to: string, content: string, nodeKey: string | null, ok: boolean, errorDetail: string | null) {
+  // El wamid permite luego actualizar el estatus real (entregado / leido / fallido)
+  // cuando llega el webhook whatsapp.message.updated
+  let wamid: string | null = null;
+  try {
+    const i = (errorDetail || "").indexOf("{");
+    if (i >= 0) {
+      const r = JSON.parse((errorDetail || "").slice(i));
+      wamid = r.wamid || r.id || null;
+    }
+  } catch { /* respuesta no JSON, se ignora */ }
+
   try {
     await sb.from("message_log").insert({
       phone: to, direction: "out", content, node_key: nodeKey,
       status: ok ? "sent" : "failed",
+      wamid,
       error_detail: ok ? null : (errorDetail || "").slice(0, 500),
     });
   } catch(e) { console.error("Error guardando message_log:", e); }
@@ -926,7 +962,7 @@ async function notificarCandidatoNuevo(candidatoPhone: string, waPhone: string, 
   }
 }
 
-async function processMessage(phone: string, userMessage: string, toPhone: string) {
+async function processMessage(phone: string, userMessage: string, toPhone: string, inboundId = "") {
   console.log("processMessage — phone:", phone, "msg:", userMessage, "to:", toPhone);
 
   // Normalizar toPhone una sola vez aquí para usar en todo el proceso
@@ -1015,6 +1051,9 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       budgetMs: BUDGET_MAX_MS,
     };
 
+    // Doble check azul + "escribiendo..." también en el primer mensaje
+    await marcarLeidoYEscribiendo(inboundId, cfg.apiKey);
+
     let { data: firstNode } = await sb.from("nodes").select("*")
       .eq("flow_id", flow.id).eq("is_start", true).maybeSingle();
 
@@ -1042,6 +1081,9 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   }
 
   const cfg = await getFlowConfig(session.flow_id, toPhone);
+
+  // Doble check azul + "escribiendo..." antes de responder
+  await marcarLeidoYEscribiendo(inboundId, cfg.apiKey);
 
   await sb.from("message_log").insert({
     phone, direction: "in", content: userMessage, node_key: session.current_node,
@@ -1134,6 +1176,205 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
 // ============================================================
 // WEBHOOK HANDLER
 // ============================================================
+
+// ============================================================
+// EVENTOS DE YCLOUD (además del mensaje entrante)
+// ============================================================
+
+// Busca un número activo DISTINTO al afectado para poder mandar la alerta
+async function buscarEmisorAlterno(phoneAfectado: string) {
+  const { data } = await sb.from("flows")
+    .select("whatsapp_phone, ycloud_api_key")
+    .eq("is_active", true)
+    .not("whatsapp_phone", "is", null);
+  const f = (data || []).find((x: any) =>
+    x.whatsapp_phone && x.whatsapp_phone !== phoneAfectado && x.ycloud_api_key);
+  return f ? { from: f.whatsapp_phone, apiKey: f.ycloud_api_key } : null;
+}
+
+// Manda una alerta a los notify_phone de los flujos que usan ese número
+async function alertarReclutadores(phoneAfectado: string, mensaje: string) {
+  const { data: flows } = await sb.from("flows")
+    .select("name, notify_phone, whatsapp_phone, ycloud_api_key")
+    .eq("whatsapp_phone", phoneAfectado);
+
+  const destinos = new Set<string>();
+  (flows || []).forEach((f: any) => {
+    (f.notify_phone || "").split(/[,\n]/)
+      .map((x: string) => x.trim())
+      .filter((x: string) => x.length > 6)
+      .forEach((x: string) => destinos.add(x));
+  });
+  if (!destinos.size) { console.log("[ALERTA] sin notify_phone configurado"); return; }
+
+  // Preferimos mandar desde otro número: el afectado puede estar caído
+  const emisor = await buscarEmisorAlterno(phoneAfectado)
+    || ((flows || [])[0]?.ycloud_api_key
+        ? { from: (flows || [])[0].whatsapp_phone, apiKey: (flows || [])[0].ycloud_api_key }
+        : null);
+  if (!emisor) { console.log("[ALERTA] sin número disponible para enviar"); return; }
+
+  for (const dest of destinos) {
+    await sendText(dest, mensaje, emisor.from, emisor.apiKey, "alerta_sistema");
+  }
+}
+
+
+// ── Alerta a TODOS los reclutadores (la cuenta afecta a todos los números) ──
+async function alertarTodos(mensaje: string) {
+  const { data: flows } = await sb.from("flows")
+    .select("notify_phone, whatsapp_phone, ycloud_api_key, is_active");
+
+  const destinos = new Set<string>();
+  (flows || []).forEach((f: any) => {
+    (f.notify_phone || "").split(/[,\n]/)
+      .map((x: string) => x.trim())
+      .filter((x: string) => x.length > 6)
+      .forEach((x: string) => destinos.add(x));
+  });
+  if (!destinos.size) { console.log("[ALERTA-GLOBAL] sin notify_phone configurado"); return; }
+
+  const emisor = (flows || []).find((f: any) => f.is_active && f.whatsapp_phone && f.ycloud_api_key)
+              || (flows || []).find((f: any) => f.whatsapp_phone && f.ycloud_api_key);
+  if (!emisor) { console.log("[ALERTA-GLOBAL] sin número disponible"); return; }
+
+  for (const dest of destinos) {
+    await sendText(dest, mensaje, emisor.whatsapp_phone, emisor.ycloud_api_key, "alerta_sistema");
+  }
+}
+
+// ── whatsapp.business_account.updated → restricción, baneo o violación ──
+async function eventoCuentaActualizada(ba: any) {
+  if (!ba) return;
+  const evento     = String(ba.updateEvent || "").toUpperCase();
+  const banState   = String(ba.banState || "").toUpperCase();
+  const revision   = String(ba.accountReviewStatus || "").toUpperCase();
+  const violacion  = ba.violationType;
+  const restric    = Array.isArray(ba.restrictions) ? ba.restrictions : [];
+
+  console.log(`[CUENTA] ${ba.name || ba.id}: evento=${evento} ban=${banState} revision=${revision}`);
+
+  // Solo alertamos cuando hay algo que atender
+  const grave =
+    ["ACCOUNT_RESTRICTION", "ACCOUNT_VIOLATION", "ACCOUNT_BANNED", "PARTNER_APP_UNINSTALLED"].includes(evento)
+    || (banState && banState !== "NOT_BANNED")
+    || revision === "REJECTED"
+    || restric.length > 0
+    || ba.removed === true;
+  if (!grave) { console.log("[CUENTA] cambio sin importancia, ignorado"); return; }
+
+  let msg = `🚨 *ALERTA DE CUENTA — CAUCE IA*\n\n`;
+  msg += `Meta reportó un cambio en la cuenta de WhatsApp Business`;
+  msg += ba.name ? ` *${ba.name}*.\n\n` : `.\n\n`;
+  if (evento)    msg += `• Evento: *${evento}*\n`;
+  if (violacion) msg += `• Tipo de violación: *${violacion}*\n`;
+  if (banState && banState !== "NOT_BANNED") {
+    msg += `• Estado de baneo: *${banState}*\n`;
+    if (ba.banDate) msg += `• Fecha: *${ba.banDate}*\n`;
+  }
+  if (revision) msg += `• Revisión de la cuenta: *${revision}*\n`;
+  if (ba.removed) {
+    msg += `• La cuenta fue *removida del partner*\n`;
+    if (ba.removedReason) msg += `• Motivo: *${ba.removedReason}*\n`;
+  }
+  restric.forEach((r: any) => {
+    msg += `• Restricción: *${r.restrictionType}*`;
+    msg += r.expiration ? ` (hasta ${String(r.expiration).slice(0, 10)})\n` : `\n`;
+  });
+  msg += `\n⚠️ _Esto puede afectar a *todos* los números. Revisa el WhatsApp Manager de Meta cuanto antes._`;
+
+  await alertarTodos(msg);
+}
+
+// ── whatsapp.business_account.deleted → la cuenta completa desapareció ──
+async function eventoCuentaEliminada(ba: any) {
+  console.log(`[CUENTA-ELIMINADA] ${ba?.name || ba?.id || "desconocida"}`);
+  const msg =
+    `🛑 *CUENTA DE WHATSAPP ELIMINADA — CAUCE IA*\n\n` +
+    `La cuenta de WhatsApp Business${ba?.name ? ` *${ba.name}*` : ""} fue eliminada.\n\n` +
+    (ba?.removedReason ? `• Motivo: *${ba.removedReason}*\n` : "") +
+    `\n🔴 *Todos los chatbots de esta cuenta dejaron de funcionar.* ` +
+    `Hay que revisar de inmediato en yCloud y en el WhatsApp Manager de Meta.`;
+  await alertarTodos(msg);
+}
+
+// ── whatsapp.message.updated → estatus real de cada mensaje ──
+async function eventoMensajeActualizado(m: any) {
+  const wamid = m?.wamid || m?.id;
+  if (!wamid || !m?.status) return;
+
+  const errorMsg = m.errorCode
+    ? `${m.errorCode}: ${m.errorMessage || ""}`.slice(0, 500)
+    : null;
+
+  const { error } = await sb.from("message_log")
+    .update({ status: m.status, error_detail: errorMsg })
+    .eq("wamid", wamid);
+
+  console.log(`[MSG-UPDATE] ${wamid} → ${m.status}${error ? " (error: " + error.message + ")" : ""}`);
+}
+
+// ── whatsapp.phone_number.quality_updated → alerta de calidad ──
+async function eventoCalidadNumero(pn: any) {
+  const phone   = pn?.phoneNumber;
+  const calidad = pn?.qualityRating;
+  const estado  = pn?.status;
+  if (!phone) return;
+
+  console.log(`[CALIDAD] ${phone}: ${calidad} / ${estado} / limite ${pn?.whatsappBusinessManagerMessagingLimit || "-"}`);
+
+  // Solo avisamos cuando hay algo que atender
+  const preocupante = ["YELLOW", "RED"].includes(String(calidad).toUpperCase())
+                   || (estado && String(estado).toUpperCase() !== "CONNECTED");
+  if (!preocupante) return;
+
+  const icono = String(calidad).toUpperCase() === "RED" ? "🔴"
+              : String(calidad).toUpperCase() === "YELLOW" ? "🟡" : "⚠️";
+
+  const msg =
+    `${icono} *ALERTA DE CALIDAD — CAUCE IA*\n\n` +
+    `El número *${pn.displayPhoneNumber || phone}* cambió de estado:\n\n` +
+    `• Calidad: *${calidad || "—"}*\n` +
+    `• Estado: *${estado || "—"}*\n` +
+    (pn.whatsappBusinessManagerMessagingLimit ? `• Límite de mensajes: *${pn.whatsappBusinessManagerMessagingLimit}*\n` : "") +
+    `\n_Meta baja la calidad cuando varios candidatos bloquean o reportan el número. ` +
+    `Si llega a rojo se restringe el envío._`;
+
+  await alertarReclutadores(phone, msg);
+}
+
+// ── whatsapp.phone_number.deleted → el número se desvinculó ──
+async function eventoNumeroEliminado(pn: any) {
+  const phone = pn?.phoneNumber;
+  if (!phone) return;
+  console.log(`[NUMERO-ELIMINADO] ${phone}`);
+
+  const msg =
+    `🛑 *NÚMERO DESVINCULADO — CAUCE IA*\n\n` +
+    `El número *${pn.displayPhoneNumber || phone}* fue eliminado de yCloud o de Meta.\n\n` +
+    `El chatbot de este número *dejó de funcionar*. Hay que revisarlo en el panel de yCloud.`;
+
+  await alertarReclutadores(phone, msg);
+}
+
+// ── whatsapp.user.preferences → el candidato pidió no recibir más ──
+async function eventoPreferenciaUsuario(up: any) {
+  const phone = up?.contactPhoneNumber;
+  const valor = String(up?.value || "").toLowerCase();
+  if (!phone) return;
+
+  const detiene = valor === "stop";
+  console.log(`[PREFERENCIA] ${phone} → ${valor}`);
+
+  await sb.from("contacts").update({
+    opted_out: detiene,
+    notes: detiene
+      ? "El candidato pidió dejar de recibir mensajes (opt-out de WhatsApp)"
+      : null,
+    updated_at: new Date().toISOString(),
+  }).eq("phone", phone);
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
   if (req.method === "GET") return new Response("OK", { status: 200, headers: corsHeaders });
@@ -1142,12 +1383,42 @@ Deno.serve(async (req) => {
     const body = await req.json();
     console.log("Body:", JSON.stringify(body));
 
-    let phone = "", userMessage = "", toPhone = "";
+    // ── Eventos que NO son mensajes entrantes ──
+    const tipoEvento = body?.type || "";
+    if (tipoEvento && tipoEvento !== "whatsapp.inbound_message.received") {
+      console.log("Evento recibido:", tipoEvento);
+      try {
+        if (tipoEvento === "whatsapp.message.updated" && body.whatsappMessage) {
+          await eventoMensajeActualizado(body.whatsappMessage);
+        } else if (tipoEvento === "whatsapp.phone_number.quality_updated") {
+          await eventoCalidadNumero(body.whatsappPhoneNumber);
+        } else if (tipoEvento === "whatsapp.phone_number.deleted") {
+          await eventoNumeroEliminado(body.whatsappPhoneNumber);
+        } else if (tipoEvento === "whatsapp.user.preferences") {
+          await eventoPreferenciaUsuario(body.whatsappUserPreference);
+        } else if (tipoEvento === "whatsapp.business_account.updated") {
+          await eventoCuentaActualizada(body.whatsappBusinessAccount);
+        } else if (tipoEvento === "whatsapp.business_account.deleted") {
+          await eventoCuentaEliminada(body.whatsappBusinessAccount);
+        } else {
+          console.log("Evento sin manejador, ignorado:", tipoEvento);
+        }
+      } catch (e) {
+        console.error("Error procesando evento", tipoEvento, e);
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    let phone = "", userMessage = "", toPhone = "", inboundId = "";
 
     if (body?.whatsappInboundMessage) {
       const msg = body.whatsappInboundMessage;
-      phone   = msg.from || "";
-      toPhone = msg.to   || "";
+      phone     = msg.from || "";
+      toPhone   = msg.to   || "";
+      inboundId = msg.id || msg.wamid || "";
       if (msg.type === "text") userMessage = msg.text?.body || "";
       else if (msg.type === "interactive") {
         userMessage = msg.interactive?.button_reply?.id
@@ -1162,12 +1433,14 @@ Deno.serve(async (req) => {
     if (!phone && body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
       const msg = body.entry[0].changes[0].value.messages[0];
       phone = msg.from || ""; toPhone = msg.to || "";
+      inboundId = msg.id || "";
       userMessage = msg.text?.body || msg.interactive?.button_reply?.id || "";
     }
 
     if (!phone && body?.message) {
       const msg = body.message;
       phone = msg.from || ""; toPhone = msg.to || "";
+      inboundId = msg.id || msg.wamid || "";
       if (msg.type === "text") userMessage = msg.text?.body || "";
       else if (msg.type === "interactive") userMessage = msg.interactive?.button_reply?.id || "";
       else if (msg.type === "button") userMessage = msg.button?.payload || "";
@@ -1176,7 +1449,7 @@ Deno.serve(async (req) => {
     console.log("Parsed — phone:", phone, "to:", toPhone, "msg:", userMessage);
 
     if (phone && userMessage) {
-      await processMessage(phone, userMessage, toPhone);
+      await processMessage(phone, userMessage, toPhone, inboundId);
     }
 
     return new Response(JSON.stringify({ ok: true }), {
