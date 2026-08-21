@@ -251,11 +251,25 @@ o
 // ============================================================
 // CONFIGURACIÓN DEL FLUJO — número + API key propios
 // ============================================================
-type FlowConfig = { from: string; apiKey: string };
+type FlowConfig = { from: string; apiKey: string; delayMs: number; budgetMs?: number };
+
+// Pausa entre mensajes para que la conversación se sienta natural
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// Topes de seguridad: yCloud espera respuesta del webhook. Si tardamos demasiado
+// da timeout y reintenta el mensaje, lo que genera respuestas duplicadas.
+const DELAY_MAX_MS  = 2000;   // maximo por mensaje
+const BUDGET_MAX_MS = 6000;   // maximo acumulado en toda la cadena de nodos
+
+function normalizarDelay(segundos: any): number {
+  const n = Number(segundos);
+  if (!isFinite(n) || n < 0) return 1000;     // default 1 segundo
+  return Math.min(Math.round(n * 1000), DELAY_MAX_MS);
+}
 
 async function getFlowConfig(flowId: string, toPhoneFallback: string = ""): Promise<FlowConfig> {
   const { data } = await sb.from("flows")
-    .select("whatsapp_phone, ycloud_api_key")
+    .select("whatsapp_phone, ycloud_api_key, message_delay")
     .eq("id", flowId)
     .maybeSingle();
 
@@ -264,6 +278,8 @@ async function getFlowConfig(flowId: string, toPhoneFallback: string = ""): Prom
     // para no responder desde el número equivocado de otro cliente
     from: data?.whatsapp_phone || toPhoneFallback || "",
     apiKey: data?.ycloud_api_key || YCLOUD_KEY_FALLBACK,
+    delayMs: normalizarDelay(data?.message_delay ?? 1),
+    budgetMs: BUDGET_MAX_MS,
   };
 }
 
@@ -565,7 +581,7 @@ async function syncContactToSheet(phone: string, forceNew: boolean = false) {
 
 // CAROUSEL — WhatsApp NO soporta carruseles en mensajes de sesión (solo en plantillas HSM aprobadas).
 // Solución: enviar las imágenes una por una con su caption, luego los botones agrupados como pregunta.
-async function sendCarousel(to: string, body: string, cards: any[], from: string, apiKey: string, nodeKey: string | null = null) {
+async function sendCarousel(to: string, body: string, cards: any[], from: string, apiKey: string, nodeKey: string | null = null, delayMs = 1000) {
   if (!cards.length) return;
 
   // 1. Enviar el texto introductorio si existe
@@ -584,8 +600,8 @@ async function sendCarousel(to: string, body: string, cards: any[], from: string
       // Sin imagen — solo texto
       await sendText(to, text, from, apiKey, nodeKey);
     }
-    // Pequeña pausa para respetar el orden de entrega
-    await new Promise(r => setTimeout(r, 300));
+    // Pausa entre tarjetas para respetar el orden de entrega
+    await sleep(delayMs);
   }
 
   // 3. Recopilar todos los botones únicos de todas las tarjetas
@@ -716,11 +732,17 @@ function esUrlValida(url: any): boolean {
 async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvance = true) {
   console.log("executeNode:", node.node_key, "type:", node.type);
   const { from, apiKey } = cfg;
+  // Pausa antes de enviar, para que no lleguen todos los mensajes de golpe.
+  // Se descuenta de un presupuesto total para no agotar el tiempo del webhook.
+  if (cfg.budgetMs === undefined) cfg.budgetMs = BUDGET_MAX_MS;
+  const espera  = Math.max(0, Math.min(cfg.delayMs ?? 1000, cfg.budgetMs));
+  if (espera > 0) { await sleep(espera); cfg.budgetMs -= espera; }
+  const delayMs = espera;
 
   // ── CARRUSEL ──
   if (node.type === "carousel") {
     const cards = node.carousel_cards || [];
-    await sendCarousel(phone, node.content || "", cards, from, apiKey, node.node_key);
+    await sendCarousel(phone, node.content || "", cards, from, apiKey, node.node_key, delayMs);
     // No auto-avanzar — esperar que el usuario toque un botón (como question)
     return;
   }
@@ -734,7 +756,7 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
     for (let i = 0; i < urlsValidas.length; i++) {
       const caption = i === 0 ? (node.content || "") : "";
       await sendImage(phone, urlsValidas[i].trim(), from, apiKey, caption, node.node_key);
-      if (i < urlsValidas.length - 1) await new Promise(r => setTimeout(r, 800));
+      if (i < urlsValidas.length - 1) await sleep(delayMs);
     }
     if (node.options?.length) {
       await sendButtons(phone, "Elige una opción:", node.options, from, apiKey, node.node_key);
@@ -989,6 +1011,8 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     const cfg: FlowConfig = {
       from: flow.whatsapp_phone || toPhoneNorm,
       apiKey: flow.ycloud_api_key || YCLOUD_KEY_FALLBACK,
+      delayMs: normalizarDelay(flow.message_delay ?? 1),
+      budgetMs: BUDGET_MAX_MS,
     };
 
     let { data: firstNode } = await sb.from("nodes").select("*")
