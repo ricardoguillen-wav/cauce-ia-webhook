@@ -1130,6 +1130,24 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     }
   }
 
+  // ── ESTATUS POR OPCIÓN ──
+  // Si la opción elegida tiene un estatus configurado en el editor de flujos,
+  // el candidato cambia a ese estatus automáticamente (ej: "no me queda la ruta" → Declino)
+  if (Array.isArray(currentNode?.options) && userMessage) {
+    const resp = userMessage.trim().toLowerCase();
+    const elegida = currentNode.options.find((o: any) =>
+      String(o.value ?? "").toLowerCase() === resp ||
+      String(o.label ?? "").toLowerCase() === resp
+    );
+    if (elegida?.status) {
+      await sb.from("contacts").update({
+        status: elegida.status,
+        updated_at: new Date().toISOString(),
+      }).eq("phone", phone);
+      console.log(`[ESTATUS-OPCION] ${phone} → ${elegida.status} (eligió "${elegida.label}")`);
+    }
+  }
+
   let { data: edge } = await sb.from("edges").select("*")
     .eq("flow_id", session.flow_id).eq("from_node", session.current_node)
     .ilike("condition", userMessage.trim()).maybeSingle();
@@ -1159,6 +1177,20 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
 
   if (nextNode.type === "end") {
     await sb.from("sessions").delete().eq("phone", phone);
+
+    // Respetar un estatus ya asignado por una opción del flujo (ej: Declino)
+    const { data: actual } = await sb.from("contacts")
+      .select("status").eq("phone", phone).maybeSingle();
+    const yaDefinido = ESTATUS_FINALES.includes(String(actual?.status || ""));
+
+    if (yaDefinido) {
+      console.log(`[FIN] ${phone} conserva estatus "${actual?.status}" — no se marca en_proceso`);
+      await sb.from("contacts").update({ updated_at: new Date().toISOString() }).eq("phone", phone);
+      await syncContactToSheet(phone);
+      // Sin cita ni notificación al reclutador: el candidato no continúa el proceso
+      return;
+    }
+
     await sb.from("contacts").update({
       status: "en_proceso", updated_at: new Date().toISOString(),
     }).eq("phone", phone);
@@ -1172,6 +1204,11 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     await handleRestart(phone, session.flow_id, nextNode, cfg);
   }
 }
+
+
+// Estatus asignados a propósito (por opción del flujo) que el nodo final
+// NO debe sobrescribir con "en_proceso"
+const ESTATUS_FINALES = ["declino", "rechazado", "descartado", "contratado", "no_responde"];
 
 // ============================================================
 // WEBHOOK HANDLER
