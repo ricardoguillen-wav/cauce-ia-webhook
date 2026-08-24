@@ -283,6 +283,63 @@ async function getFlowConfig(flowId: string, toPhoneFallback: string = ""): Prom
   };
 }
 
+
+// ============================================================
+// MEDIA — descarga la imagen de yCloud y la guarda en Supabase Storage
+// para que se pueda ver en el Inbox sin necesidad de la API key
+// ============================================================
+async function guardarMedia(url: string, apiKey: string, phone: string): Promise<string | null> {
+  if (!url) return null;
+  try {
+    const res = await fetch(url, { headers: { "X-API-Key": apiKey } });
+    if (!res.ok) {
+      console.log(`[MEDIA] no se pudo descargar (${res.status}) — se guarda el enlace original`);
+      return url;
+    }
+    const tipo  = res.headers.get("content-type") || "image/jpeg";
+    const bytes = new Uint8Array(await res.arrayBuffer());
+
+    const ext  = tipo.includes("png")  ? "png"
+               : tipo.includes("webp") ? "webp"
+               : tipo.includes("mp4")  ? "mp4"
+               : tipo.includes("pdf")  ? "pdf"
+               : tipo.includes("ogg")  ? "ogg" : "jpg";
+    const ruta = `recibidos/${phone.replace(/\D/g, "")}/${Date.now()}.${ext}`;
+
+    const up = await fetch(
+      `${Deno.env.get("SUPABASE_URL")}/storage/v1/object/chatbot-media/${ruta}`,
+      { method: "POST",
+        headers: {
+          "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
+          "Content-Type": tipo,
+          "x-upsert": "true",
+        },
+        body: bytes }
+    );
+    if (!up.ok) {
+      console.log(`[MEDIA] fallo al subir (${up.status}) — se guarda el enlace original`);
+      return url;
+    }
+    const publica = `${Deno.env.get("SUPABASE_URL")}/storage/v1/object/public/chatbot-media/${ruta}`;
+    console.log(`[MEDIA] guardada: ${publica}`);
+    return publica;
+  } catch (e) {
+    console.log("[MEDIA] error:", e);
+    return url;
+  }
+}
+
+// Extrae media y texto de un mensaje entrante, sea del formato que sea
+function extraerMedia(msg: any): { url: string; caption: string; tipo: string } | null {
+  for (const t of ["image", "video", "document", "audio", "sticker", "voice"]) {
+    const o = msg?.[t];
+    if (o && (o.link || o.url || o.id)) {
+      return { url: o.link || o.url || "", caption: o.caption || "", tipo: t };
+    }
+  }
+  return null;
+}
+
 // ============================================================
 // TYPING INDICATOR — marca el mensaje como leído (doble check azul)
 // y muestra "escribiendo..." mientras preparamos la respuesta.
@@ -1335,6 +1392,61 @@ async function eventoCuentaEliminada(ba: any) {
   await alertarTodos(msg);
 }
 
+
+// ── whatsapp.smb.message.echoes → mensaje enviado desde la app del celular ──
+async function eventoEchoCelular(m: any) {
+  const to = m?.to;
+  if (!to) return;
+
+  let contenido = "";
+  if (m.type === "text") {
+    contenido = m.text?.body || "";
+  } else {
+    const med = extraerMedia(m);
+    if (med) {
+      const { data: fl } = await sb.from("flows")
+        .select("ycloud_api_key").eq("whatsapp_phone", m.from).maybeSingle();
+      const url = await guardarMedia(med.url, fl?.ycloud_api_key || YCLOUD_KEY_FALLBACK, to);
+      const etiqueta = med.tipo === "image" || med.tipo === "sticker" ? "[Imagen]"
+                     : med.tipo === "video" ? "[Video]"
+                     : med.tipo === "audio" || med.tipo === "voice" ? "[Audio]" : "[Archivo]";
+      contenido = `${etiqueta} ${url || ""}${med.caption ? "\n" + med.caption : ""}`;
+    } else {
+      contenido = `[${m.type || "mensaje"}]`;
+    }
+  }
+  if (!contenido) return;
+
+  await sb.from("message_log").insert({
+    phone: to, direction: "out", content: contenido,
+    node_key: "desde_celular", wamid: m.wamid || m.id || null,
+    status: m.status || "sent",
+  }).catch(() => {});
+  console.log(`[ECHO] mensaje del celular a ${to} registrado`);
+}
+
+// ── whatsapp.smb.history → historial previo al conectar el número ──
+async function eventoHistorialCelular(h: any) {
+  const mensajes = h?.messages || h?.history || [];
+  if (!Array.isArray(mensajes) || !mensajes.length) {
+    console.log("[HISTORIAL] sin mensajes o el negocio no compartió el historial");
+    return;
+  }
+  const filas = mensajes.slice(0, 500).map((m: any) => ({
+    phone: m.from === h.displayPhoneNumber ? m.to : m.from,
+    direction: m.from === h.displayPhoneNumber ? "out" : "in",
+    content: m.text?.body || `[${m.type || "mensaje"}]`,
+    node_key: "historial_celular",
+    wamid: m.wamid || m.id || null,
+    created_at: m.sendTime || m.createTime || new Date().toISOString(),
+  })).filter((f: any) => f.phone);
+
+  if (filas.length) {
+    await sb.from("message_log").insert(filas).catch(() => {});
+    console.log(`[HISTORIAL] ${filas.length} mensajes importados`);
+  }
+}
+
 // ── whatsapp.message.updated → estatus real de cada mensaje ──
 async function eventoMensajeActualizado(m: any) {
   const wamid = m?.wamid || m?.id;
@@ -1437,6 +1549,10 @@ Deno.serve(async (req) => {
           await eventoCuentaActualizada(body.whatsappBusinessAccount);
         } else if (tipoEvento === "whatsapp.business_account.deleted") {
           await eventoCuentaEliminada(body.whatsappBusinessAccount);
+        } else if (tipoEvento === "whatsapp.smb.message.echoes") {
+          await eventoEchoCelular(body.whatsappMessage);
+        } else if (tipoEvento === "whatsapp.smb.history") {
+          await eventoHistorialCelular(body.whatsappHistory || body.history);
         } else {
           console.log("Evento sin manejador, ignorado:", tipoEvento);
         }
@@ -1450,6 +1566,7 @@ Deno.serve(async (req) => {
     }
 
     let phone = "", userMessage = "", toPhone = "", inboundId = "";
+    let media: { url: string; caption: string; tipo: string } | null = null;
 
     if (body?.whatsappInboundMessage) {
       const msg = body.whatsappInboundMessage;
@@ -1465,12 +1582,20 @@ Deno.serve(async (req) => {
           || "";
       }
       else if (msg.type === "button") userMessage = msg.button?.payload || msg.button?.text || "";
+      else {
+        media = extraerMedia(msg);
+        if (media) userMessage = media.caption || "";
+      }
     }
 
     if (!phone && body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
       const msg = body.entry[0].changes[0].value.messages[0];
       phone = msg.from || ""; toPhone = msg.to || "";
       inboundId = msg.id || "";
+      if (!["text","interactive","button"].includes(msg.type)) {
+        media = extraerMedia(msg);
+        if (media && !userMessage) userMessage = media.caption || "";
+      }
       userMessage = msg.text?.body || msg.interactive?.button_reply?.id || "";
     }
 
@@ -1478,6 +1603,10 @@ Deno.serve(async (req) => {
       const msg = body.message;
       phone = msg.from || ""; toPhone = msg.to || "";
       inboundId = msg.id || msg.wamid || "";
+      if (!["text","interactive","button"].includes(msg.type)) {
+        media = extraerMedia(msg);
+        if (media && !userMessage) userMessage = media.caption || "";
+      }
       if (msg.type === "text") userMessage = msg.text?.body || "";
       else if (msg.type === "interactive") userMessage = msg.interactive?.button_reply?.id || "";
       else if (msg.type === "button") userMessage = msg.button?.payload || "";
@@ -1486,6 +1615,30 @@ Deno.serve(async (req) => {
     console.log("Parsed — phone:", phone, "to:", toPhone, "msg:", userMessage);
 
     if (phone && userMessage) {
+      // Imagen o archivo recibido: se guarda y se registra en la conversación
+      if (media) {
+        const { data: fl } = await sb.from("flows")
+          .select("ycloud_api_key").eq("whatsapp_phone", toPhone).maybeSingle();
+        const key = fl?.ycloud_api_key || YCLOUD_KEY_FALLBACK;
+        const urlFinal = await guardarMedia(media.url, key, phone);
+
+        const etiqueta = media.tipo === "image" || media.tipo === "sticker" ? "[Imagen]"
+                       : media.tipo === "video" ? "[Video]"
+                       : media.tipo === "audio" || media.tipo === "voice" ? "[Audio]"
+                       : "[Archivo]";
+        await sb.from("message_log").insert({
+          phone, direction: "in",
+          content: `${etiqueta} ${urlFinal || ""}${media.caption ? "\n" + media.caption : ""}`,
+          node_key: "media_recibida",
+        }).catch(() => {});
+        console.log(`[MEDIA-IN] ${media.tipo} de ${phone} registrado`);
+
+        // Sin texto no se puede avanzar el flujo: solo queda registrado
+        if (!media.caption) return new Response(JSON.stringify({ ok: true }), {
+          status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
       await processMessage(phone, userMessage, toPhone, inboundId);
     }
 
