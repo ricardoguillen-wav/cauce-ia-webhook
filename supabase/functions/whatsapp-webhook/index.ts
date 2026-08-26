@@ -284,6 +284,151 @@ async function getFlowConfig(flowId: string, toPhoneFallback: string = ""): Prom
 }
 
 
+
+// ============================================================
+// FECHA DE CITA — convierte lo que escribe el candidato a una fecha real
+// Primero por reglas (rápido y sin depender de nadie), DeepSeek de respaldo
+// ============================================================
+const DIAS_SEMANA: Record<string, number> = {
+  domingo:0, lunes:1, martes:2, miercoles:3, "miércoles":3, jueves:4,
+  viernes:5, sabado:6, "sábado":6,
+};
+const MESES: Record<string, number> = {
+  enero:0, febrero:1, marzo:2, abril:3, mayo:4, junio:5, julio:6,
+  agosto:7, septiembre:8, setiembre:8, octubre:9, noviembre:10, diciembre:11,
+};
+
+function hoyMonterrey(): Date {
+  const d = new Date(Date.now() - 6 * 3600 * 1000);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+const aISO = (d: Date) => d.toISOString().slice(0, 10);
+
+// Devuelve { fecha: "YYYY-MM-DD" | null, hora: "HH:MM" | null }
+function parsearCitaLocal(texto: string): { fecha: string | null; hora: string | null } {
+  if (!texto) return { fecha: null, hora: null };
+  const t = texto.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+  const hoy = hoyMonterrey();
+
+  // ── Hora ──
+  let hora: string | null = null;
+  const mHora = t.match(/(\d{1,2})[:.](\d{2})\s*(am|pm|hrs|horas)?/)
+             || t.match(/(?:a\s+las?\s+)?(\d{1,2})\s*(am|pm)/);
+  if (mHora) {
+    let h = parseInt(mHora[1], 10);
+    const min = mHora[2] && /^\d{2}$/.test(mHora[2]) ? mHora[2] : "00";
+    const suf = (mHora[3] || mHora[2] || "").toLowerCase();
+    if (suf === "pm" && h < 12) h += 12;
+    if (suf === "am" && h === 12) h = 0;
+    if (h >= 0 && h <= 23) hora = `${String(h).padStart(2,"0")}:${min}`;
+  }
+
+  // ── Fecha relativa ──
+  if (/\bpasado\s+manana\b/.test(t)) {
+    const d = new Date(hoy); d.setUTCDate(d.getUTCDate() + 2);
+    return { fecha: aISO(d), hora };
+  }
+  if (/\bmanana\b/.test(t)) {
+    const d = new Date(hoy); d.setUTCDate(d.getUTCDate() + 1);
+    return { fecha: aISO(d), hora };
+  }
+  if (/\bhoy\b/.test(t)) return { fecha: aISO(hoy), hora };
+
+  // ── dd/mm o dd-mm (con año opcional) ──
+  const mNum = t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
+  if (mNum) {
+    const dia = +mNum[1], mes = +mNum[2] - 1;
+    let anio = mNum[3] ? +mNum[3] : hoy.getUTCFullYear();
+    if (anio < 100) anio += 2000;
+    if (dia >= 1 && dia <= 31 && mes >= 0 && mes <= 11) {
+      let f = new Date(Date.UTC(anio, mes, dia));
+      // Sin año explícito y ya pasó: se asume el año siguiente
+      if (!mNum[3] && f < hoy) f = new Date(Date.UTC(anio + 1, mes, dia));
+      return { fecha: aISO(f), hora };
+    }
+  }
+
+  // ── "21 de julio" / "julio 21" ──
+  for (const [nombre, mes] of Object.entries(MESES)) {
+    if (!t.includes(nombre)) continue;
+    const mDia = t.match(new RegExp(`(\\d{1,2})\\s*(?:de\\s+)?${nombre}`))
+              || t.match(new RegExp(`${nombre}\\s*(?:de\\s+)?(\\d{1,2})`));
+    if (mDia) {
+      const dia = +mDia[1];
+      if (dia >= 1 && dia <= 31) {
+        let f = new Date(Date.UTC(hoy.getUTCFullYear(), mes, dia));
+        if (f < hoy) f = new Date(Date.UTC(hoy.getUTCFullYear() + 1, mes, dia));
+        return { fecha: aISO(f), hora };
+      }
+    }
+  }
+
+  // ── Día de la semana, con número de día opcional ("lunes 21") ──
+  for (const [nombre, dow] of Object.entries(DIAS_SEMANA)) {
+    if (!new RegExp(`\\b${nombre}\\b`).test(t)) continue;
+
+    const mDia = t.match(new RegExp(`${nombre}\\s+(\\d{1,2})\\b`));
+    if (mDia) {
+      const dia = +mDia[1];
+      for (let k = 0; k < 3; k++) {
+        const f = new Date(Date.UTC(hoy.getUTCFullYear(), hoy.getUTCMonth() + k, dia));
+        if (f >= hoy) return { fecha: aISO(f), hora };
+      }
+    }
+    // Próxima ocurrencia de ese día
+    const d = new Date(hoy);
+    let delta = (dow - d.getUTCDay() + 7) % 7;
+    if (delta === 0) delta = 7;               // "el lunes" dicho en lunes = el siguiente
+    d.setUTCDate(d.getUTCDate() + delta);
+    return { fecha: aISO(d), hora };
+  }
+
+  // ── Solo un número suelto: día de este mes o del siguiente ──
+  const mSolo = t.match(/\b(\d{1,2})\b/);
+  if (mSolo && !hora) {
+    const dia = +mSolo[1];
+    if (dia >= 1 && dia <= 31) {
+      for (let k = 0; k < 2; k++) {
+        const f = new Date(Date.UTC(hoy.getUTCFullYear(), hoy.getUTCMonth() + k, dia));
+        if (f >= hoy) return { fecha: aISO(f), hora };
+      }
+    }
+  }
+
+  return { fecha: null, hora };
+}
+
+// DeepSeek como respaldo cuando las reglas no alcanzan
+async function parsearCitaIA(texto: string): Promise<string | null> {
+  if (!texto || !DEEPSEEK_KEY) return null;
+  const hoy = hoyMonterrey();
+  const prompt = `Hoy es ${aISO(hoy)}. El candidato escribió: "${texto}".\n` +
+    `Devuelve SOLO la fecha en formato YYYY-MM-DD, o la palabra null si no se puede saber. Sin explicaciones.`;
+  try {
+    const res = await fetch(DEEPSEEK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${DEEPSEEK_KEY}` },
+      body: JSON.stringify({ model: "deepseek-chat", temperature: 0, max_tokens: 16,
+                             messages: [{ role: "user", content: prompt }] })
+    });
+    const data = await res.json();
+    const r = (data?.choices?.[0]?.message?.content || "").trim();
+    return /^\d{4}-\d{2}-\d{2}$/.test(r) ? r : null;
+  } catch { return null; }
+}
+
+// Guarda la cita normalizada en el contacto
+async function guardarCita(phone: string, texto: string) {
+  let { fecha, hora } = parsearCitaLocal(texto);
+  if (!fecha) fecha = await parsearCitaIA(texto);
+  if (!fecha) { console.log(`[CITA] no se pudo interpretar "${texto}"`); return; }
+
+  await sb.from("contacts").update({
+    cita_fecha: fecha, cita_hora: hora, updated_at: new Date().toISOString()
+  }).eq("phone", phone);
+  console.log(`[CITA] ${phone} → ${fecha}${hora ? " " + hora : ""} (de "${texto}")`);
+}
+
 // ============================================================
 // MEDIA — descarga la imagen de yCloud y la guarda en Supabase Storage
 // para que se pueda ver en el Inbox sin necesidad de la API key
@@ -1184,6 +1329,12 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
         { onConflict: "contact_id,field_key" }
       );
       console.log(`Captured [${currentNode.capture_field}${currentNode.capture_strict ? " strict" : ""}]: "${normalizedValue}"`);
+
+      // Si es la fecha de la cita, se guarda también como fecha real para la agenda
+      const campo = currentNode.capture_field.toLowerCase();
+      if (campo.includes("disponibilidad") || campo.includes("fecha") || campo.includes("cita")) {
+        guardarCita(phone, normalizedValue).catch(e => console.error("guardarCita:", e));
+      }
     }
   }
 
