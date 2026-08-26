@@ -305,10 +305,12 @@ function hoyMonterrey(): Date {
 const aISO = (d: Date) => d.toISOString().slice(0, 10);
 
 // Devuelve { fecha: "YYYY-MM-DD" | null, hora: "HH:MM" | null }
-function parsearCitaLocal(texto: string): { fecha: string | null; hora: string | null } {
+// refISO: día en que el candidato escribió el texto. "mañana" es relativo a ESE día,
+// no al día en que se procesa. Si no se pasa, se usa hoy.
+function parsearCitaLocal(texto: string, refISO?: string): { fecha: string | null; hora: string | null } {
   if (!texto) return { fecha: null, hora: null };
   const t = texto.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
-  const hoy = hoyMonterrey();
+  const hoy = refISO ? new Date(refISO + "T00:00:00Z") : hoyMonterrey();
 
   // ── Hora ──
   let hora: string | null = null;
@@ -399,10 +401,11 @@ function parsearCitaLocal(texto: string): { fecha: string | null; hora: string |
 }
 
 // DeepSeek como respaldo cuando las reglas no alcanzan
-async function parsearCitaIA(texto: string): Promise<string | null> {
+async function parsearCitaIA(texto: string, refISO?: string): Promise<string | null> {
   if (!texto || !DEEPSEEK_KEY) return null;
-  const hoy = hoyMonterrey();
-  const prompt = `Hoy es ${aISO(hoy)}. El candidato escribió: "${texto}".\n` +
+  const hoy = refISO ? new Date(refISO + "T00:00:00Z") : hoyMonterrey();
+  const prompt = `El candidato escribió esto el ${aISO(hoy)}: "${texto}".\n` +
+    `Interpreta las palabras relativas (hoy, mañana, el jueves) tomando como referencia ESA fecha.\n` +
     `Devuelve SOLO la fecha en formato YYYY-MM-DD, o la palabra null si no se puede saber. Sin explicaciones.`;
   try {
     const res = await fetch(DEEPSEEK_URL, {
@@ -418,9 +421,9 @@ async function parsearCitaIA(texto: string): Promise<string | null> {
 }
 
 // Guarda la cita normalizada en el contacto
-async function guardarCita(phone: string, texto: string) {
-  let { fecha, hora } = parsearCitaLocal(texto);
-  if (!fecha) fecha = await parsearCitaIA(texto);
+async function guardarCita(phone: string, texto: string, refISO?: string) {
+  let { fecha, hora } = parsearCitaLocal(texto, refISO);
+  if (!fecha) fecha = await parsearCitaIA(texto, refISO);
   if (!fecha) { console.log(`[CITA] no se pudo interpretar "${texto}"`); return; }
 
   await sb.from("contacts").update({
