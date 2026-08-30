@@ -251,7 +251,7 @@ o
 // ============================================================
 // CONFIGURACIÓN DEL FLUJO — número + API key propios
 // ============================================================
-type FlowConfig = { from: string; apiKey: string; delayMs: number; budgetMs?: number };
+type FlowConfig = { from: string; apiKey: string; delayMs: number; budgetMs?: number; rec?: any };
 
 // Pausa entre mensajes para que la conversación se sienta natural
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -273,13 +273,20 @@ async function getFlowConfig(flowId: string, toPhoneFallback: string = ""): Prom
     .eq("id", flowId)
     .maybeSingle();
 
+  // El reclutador dueño del número aporta su nombre, su API key y sus variables
+  const norm = toPhoneFallback
+    ? (toPhoneFallback.startsWith("+") ? toPhoneFallback : "+" + toPhoneFallback)
+    : "";
+  const rec = norm ? await buscarReclutador(norm, norm.replace(/^\+/, "")) : null;
+
   return {
     // Si el flujo no tiene número configurado, usar el número que recibió el mensaje
     // para no responder desde el número equivocado de otro cliente
-    from: data?.whatsapp_phone || toPhoneFallback || "",
-    apiKey: data?.ycloud_api_key || YCLOUD_KEY_FALLBACK,
+    from: rec?.whatsapp_phone || data?.whatsapp_phone || toPhoneFallback || "",
+    apiKey: rec?.ycloud_api_key || data?.ycloud_api_key || YCLOUD_KEY_FALLBACK,
     delayMs: normalizarDelay(data?.message_delay ?? 1),
     budgetMs: BUDGET_MAX_MS,
+    rec,
   };
 }
 
@@ -868,15 +875,57 @@ async function sendCarousel(to: string, body: string, cards: any[], from: string
   }
 }
 
-async function resolveVariables(text: string, phone: string): Promise<string> {
+
+// ============================================================
+// RECLUTADORES POR FLUJO
+// Un flujo puede tener varios reclutadores; cada número es de uno
+// ============================================================
+async function buscarReclutador(phoneNorm: string, phonePlain: string) {
+  try {
+    const { data } = await sb.from("flow_recruiters")
+      .select("*")
+      .in("whatsapp_phone", [phoneNorm, phonePlain])
+      .eq("activo", true)
+      .maybeSingle();
+    return data || null;
+  } catch {
+    return null;   // la tabla puede no existir todavía
+  }
+}
+
+// Variables que aporta el reclutador: {{reclutador}}, {{tel_reclutador}}, {{web}}
+// y cualquier otra que él haya definido en "campos"
+function variablesReclutador(rec: any): Record<string, string> {
+  if (!rec) return {};
+  const v: Record<string, string> = {
+    reclutador:     rec.nombre       || "",
+    tel_reclutador: rec.tel_directo  || rec.whatsapp_phone || "",
+    web:            rec.web_url      || "",
+  };
+  if (rec.campos && typeof rec.campos === "object") {
+    for (const [k, val] of Object.entries(rec.campos)) v[k] = String(val ?? "");
+  }
+  return v;
+}
+
+async function resolveVariables(text: string, phone: string, rec?: any): Promise<string> {
   if (!text || !text.includes("{{")) return text;
-  const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
-  if (!contact) return text;
-  const { data: fields } = await sb.from("contact_data").select("field_key, field_value").eq("contact_id", contact.id);
   let resolved = text;
-  (fields || []).forEach((f: any) => {
-    resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
-  });
+
+  // Primero las del reclutador que atiende este número
+  for (const [k, val] of Object.entries(variablesReclutador(rec))) {
+    resolved = resolved.replace(new RegExp(`{{${k}}}`, "g"), val);
+  }
+
+  // Luego los datos capturados del candidato
+  const { data: contact } = await sb.from("contacts").select("id").eq("phone", phone).maybeSingle();
+  if (contact) {
+    const { data: fields } = await sb.from("contact_data")
+      .select("field_key, field_value").eq("contact_id", contact.id);
+    (fields || []).forEach((f: any) => {
+      resolved = resolved.replace(new RegExp(`{{${f.field_key}}}`, "g"), f.field_value || "");
+    });
+  }
   return resolved;
 }
 
@@ -927,7 +976,7 @@ async function handleRestart(phone: string, flowId: string, restartNode: any, cf
   });
 
   // 5. Ejecutar el nodo destino
-  const nodeToSend = { ...targetNode, content: await resolveVariables(targetNode.content, phone) };
+  const nodeToSend = { ...targetNode, content: await resolveVariables(targetNode.content, phone, cfg.rec) };
   await executeNode(phone, nodeToSend, cfg);
   console.log(`Flujo reiniciado para ${phone} desde nodo: ${targetNode.node_key}`);
 }
@@ -946,7 +995,7 @@ async function autoAdvanceNode(phone: string, node: any, cfg: FlowConfig) {
   if (!nextNode) return;
 
   await sb.from("sessions").update({ current_node: edge.to_node, updated_at: new Date().toISOString() }).eq("phone", phone);
-  const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
+  const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone, cfg.rec) };
   await executeNode(phone, nodeToSend, cfg);
 
   if (nextNode.type === "end") {
@@ -986,6 +1035,23 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
     await sendCarousel(phone, node.content || "", cards, from, apiKey, node.node_key, delayMs);
     // No auto-avanzar — esperar que el usuario toque un botón (como question)
     return;
+  }
+
+  // Las imágenes también admiten variables: {{flyer}} puede ser distinto por reclutador
+  if (cfg.rec) {
+    const vars = variablesReclutador(cfg.rec);
+    const sustituir = (u: string) => {
+      let r = u || "";
+      for (const [k, v] of Object.entries(vars)) r = r.replace(new RegExp(`{{${k}}}`, "g"), v);
+      return r;
+    };
+    if (typeof node.media_url === "string" && node.media_url.includes("{{")) {
+      node = { ...node, media_url: sustituir(node.media_url) };
+    }
+    if (Array.isArray(node.media_urls)) {
+      node = { ...node, media_urls: node.media_urls.map((u: any) =>
+        typeof u === "string" && u.includes("{{") ? sustituir(u) : u) };
+    }
   }
 
   if (node.media_urls?.length > 1) {
@@ -1231,13 +1297,32 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       }
     }
 
-    let { data: flow } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
-      .eq("is_active", true).eq("whatsapp_phone", toPhoneNorm).maybeSingle();
+    // Primero se busca si el número pertenece a un reclutador de algún flujo.
+    // Así un mismo flujo puede atender varios números, cada uno personalizado.
+    const rec = await buscarReclutador(toPhoneNorm, toPhonePlain);
 
+    let flow: any = null;
+    if (rec) {
+      const { data: f } = await sb.from("flows")
+        .select("id, whatsapp_phone, ycloud_api_key, message_delay")
+        .eq("id", rec.flow_id).eq("is_active", true).maybeSingle();
+      if (f) {
+        flow = { ...f, whatsapp_phone: rec.whatsapp_phone,
+                 ycloud_api_key: rec.ycloud_api_key || f.ycloud_api_key };
+        console.log(`[RECLUTADOR] ${rec.nombre} — flujo ${f.id}`);
+      }
+    }
+
+    // Si no hay reclutador, se usa el número asignado directamente al flujo
     if (!flow) {
-      const { data: flow2 } = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key")
-        .eq("is_active", true).eq("whatsapp_phone", toPhonePlain).maybeSingle();
-      flow = flow2;
+      const r1 = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key, message_delay")
+        .eq("is_active", true).eq("whatsapp_phone", toPhoneNorm).maybeSingle();
+      flow = r1.data;
+      if (!flow) {
+        const r2 = await sb.from("flows").select("id, whatsapp_phone, ycloud_api_key, message_delay")
+          .eq("is_active", true).eq("whatsapp_phone", toPhonePlain).maybeSingle();
+        flow = r2.data;
+      }
     }
 
     // Sin fallback a "cualquier flujo activo" — si el número no tiene flujo
@@ -1254,6 +1339,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       apiKey: flow.ycloud_api_key || YCLOUD_KEY_FALLBACK,
       delayMs: normalizarDelay(flow.message_delay ?? 1),
       budgetMs: BUDGET_MAX_MS,
+      rec,
     };
 
     // Doble check azul + "escribiendo..." también en el primer mensaje
@@ -1280,7 +1366,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       { onConflict: "phone" }
     );
 
-    const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone) };
+    const nodeToSend = { ...firstNode, content: await resolveVariables(firstNode.content, phone, cfg.rec) };
     await executeNode(phone, nodeToSend, cfg);
     return;
   }
@@ -1383,7 +1469,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     current_node: edge.to_node, updated_at: new Date().toISOString(),
   }).eq("phone", phone);
 
-  const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone) };
+  const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone, cfg.rec) };
   await executeNode(phone, nodeToSend, cfg);
 
   if (nextNode.type === "end") {
