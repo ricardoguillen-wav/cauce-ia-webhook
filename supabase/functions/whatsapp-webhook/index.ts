@@ -495,6 +495,44 @@ function extraerMedia(msg: any): { url: string; caption: string; tipo: string } 
   return null;
 }
 
+
+// ============================================================
+// ANTI-DUPLICADOS
+// yCloud reintenta el webhook si tardamos en responder (pasa al mandar
+// muchas fotos). Sin esto, el mismo mensaje se procesa dos veces y el
+// flujo se descuadra.
+// ============================================================
+const vistosEnMemoria = new Map<string, number>();
+
+async function yaProcesado(inboundId: string): Promise<boolean> {
+  if (!inboundId) return false;
+
+  // 1) Memoria del isolate: atrapa los reintentos inmediatos
+  const ahora = Date.now();
+  for (const [k, t] of vistosEnMemoria) {
+    if (ahora - t > 10 * 60 * 1000) vistosEnMemoria.delete(k);
+  }
+  if (vistosEnMemoria.has(inboundId)) {
+    console.log(`[DUPLICADO] ${inboundId} ya se procesó (memoria)`);
+    return true;
+  }
+  vistosEnMemoria.set(inboundId, ahora);
+
+  // 2) Base de datos: atrapa los reintentos que caen en otro isolate
+  try {
+    const { error } = await sb.from("processed_messages").insert({ wamid: inboundId });
+    if (error) {
+      // Choque con la llave única = ya estaba registrado
+      if (String(error.code) === "23505" || /duplicate/i.test(error.message || "")) {
+        console.log(`[DUPLICADO] ${inboundId} ya se procesó (base)`);
+        return true;
+      }
+    }
+  } catch { /* si la tabla no existe, seguimos con la memoria */ }
+
+  return false;
+}
+
 // ============================================================
 // TYPING INDICATOR — marca el mensaje como leído (doble check azul)
 // y muestra "escribiendo..." mientras preparamos la respuesta.
@@ -1099,10 +1137,19 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
     if (urlsValidas.length === 0) {
       console.warn(`Nodo ${node.node_key}: media_urls sin URLs válidas, saltando imágenes`);
     }
+    // Con muchas imágenes la pausa se acorta: si tardamos demasiado en
+    // responder, yCloud reintenta el webhook y se duplica el mensaje.
+    const pausaEntreFotos = urlsValidas.length > 4
+      ? Math.min(delayMs, 400)
+      : delayMs;
+    if (urlsValidas.length > 4) {
+      console.log(`Nodo ${node.node_key}: ${urlsValidas.length} imágenes, pausa reducida a ${pausaEntreFotos}ms`);
+    }
+
     for (let i = 0; i < urlsValidas.length; i++) {
       const caption = i === 0 ? (node.content || "") : "";
       await sendMedia(phone, urlsValidas[i].trim(), from, apiKey, caption, node.node_key);
-      if (i < urlsValidas.length - 1) await sleep(delayMs);
+      if (i < urlsValidas.length - 1) await sleep(pausaEntreFotos);
     }
     if (node.options?.length) {
       await sendButtons(phone, "Elige una opción:", node.options, from, apiKey, node.node_key);
@@ -1503,6 +1550,12 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   }
 
   if (!edge) {
+    // Si no hay texto del candidato, no es que no se entienda: es un evento
+    // repetido o un mensaje vacío. Mejor callar que confundirlo.
+    if (!userMessage || !userMessage.trim()) {
+      console.log(`[SIN-EDGE] ${phone} en ${session.current_node} sin mensaje — se ignora`);
+      return;
+    }
     await sendText(phone, "No entendí tu respuesta. Por favor elige una de las opciones disponibles.", cfg.from, cfg.apiKey, session.current_node);
     return;
   }
@@ -1901,6 +1954,13 @@ Deno.serve(async (req) => {
     console.log("Parsed — phone:", phone, "to:", toPhone, "msg:", userMessage);
 
     if (phone && userMessage) {
+      // Reintento del mismo mensaje: se ignora
+      if (await yaProcesado(inboundId)) {
+        return new Response(JSON.stringify({ ok: true, duplicado: true }), {
+          status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
       // Imagen o archivo recibido: se guarda y se registra en la conversación
       if (media) {
         const { data: fl } = await sb.from("flows")
