@@ -559,6 +559,45 @@ async function sendText(to: string, text: string, from: string, apiKey: string, 
   await logOutbound(to, textoSeguro, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
 }
 
+// Detecta qué tipo de archivo es por su extensión
+function tipoDeMedia(url: string): "image" | "audio" | "video" | "document" {
+  const u = (url || "").toLowerCase().split("?")[0];
+  if (/\.(mp3|ogg|oga|opus|m4a|aac|amr|wav)$/.test(u)) return "audio";
+  if (/\.(mp4|3gp|mov|m4v)$/.test(u))                  return "video";
+  if (/\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|csv)$/.test(u)) return "document";
+  return "image";
+}
+
+// Envía cualquier archivo: imagen, audio, video o documento
+async function sendMedia(to: string, url: string, from: string, apiKey: string, caption?: string, nodeKey: string | null = null) {
+  const tipo = tipoDeMedia(url);
+  const cap  = caption ? caption.slice(0, 1024) : undefined;
+
+  const payload: any = { from, to, type: tipo, [tipo]: { link: url.trim() } };
+
+  // El audio no admite texto al pie; el resto sí
+  if (cap && tipo !== "audio") payload[tipo].caption = cap;
+  if (tipo === "document") payload.document.filename = decodeURIComponent(url.split("/").pop() || "documento");
+
+  const res = await fetch(YCLOUD_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
+    body: JSON.stringify(payload),
+  });
+  const resText = await res.text();
+  console.log(`sendMedia (${tipo}) response:`, res.status, resText.slice(0, 200));
+
+  const etiqueta = tipo === "audio" ? "[Audio]" : tipo === "video" ? "[Video]"
+                 : tipo === "document" ? "[Archivo]" : "[Imagen]";
+  const registro = cap && tipo !== "audio" ? `${etiqueta} ${url}\n${cap}` : `${etiqueta} ${url}`;
+  await logOutbound(to, registro, nodeKey, res.ok, `HTTP ${res.status}: ${resText}`);
+
+  // El audio no lleva texto: si el nodo tenía contenido, se manda aparte
+  if (cap && tipo === "audio") {
+    await sendText(to, cap, from, apiKey, nodeKey);
+  }
+}
+
 async function sendImage(to: string, url: string, from: string, apiKey: string, caption?: string, nodeKey: string | null = null) {
   const captionSeguro = caption ? caption.slice(0, 1024) : caption; // limite de caption en imagenes
   const payload: any = { from, to, type: "image", image: { link: url } };
@@ -1062,7 +1101,7 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
     }
     for (let i = 0; i < urlsValidas.length; i++) {
       const caption = i === 0 ? (node.content || "") : "";
-      await sendImage(phone, urlsValidas[i].trim(), from, apiKey, caption, node.node_key);
+      await sendMedia(phone, urlsValidas[i].trim(), from, apiKey, caption, node.node_key);
       if (i < urlsValidas.length - 1) await sleep(delayMs);
     }
     if (node.options?.length) {
@@ -1074,7 +1113,7 @@ async function executeNode(phone: string, node: any, cfg: FlowConfig, autoAdvanc
   }
 
   if (esUrlValida(node.media_url)) {
-    await sendImage(phone, node.media_url.trim(), from, apiKey, node.content || "", node.node_key);
+    await sendMedia(phone, node.media_url.trim(), from, apiKey, node.content || "", node.node_key);
     if (node.options?.length) {
       await sendButtons(phone, "Elige una opción:", node.options, from, apiKey, node.node_key);
     } else if (autoAdvance) {
