@@ -17,25 +17,33 @@ const corsHeaders = {
 };
 
 // Plantillas por defecto — sin emojis, en texto plano con variables {{...}}
+// Textos base de los recordatorios. Cada número puede tener el suyo
+// desde la sección WhatsApp; si no lo tiene, se usan estos.
 const DEFAULT_MSG_NOCHE =
-  `Hola {{nombre}}, te recordamos que *mañana* tienes tu entrevista de trabajo.
+`¡Hola {{nombre}}! 👋 Te recuerdo que *mañana* tienes tu entrevista 📅
 
-Puesto: {{puesto}}
-Empresa: {{empresa}}
-Hora acordada: {{disponibilidad}}
+🏭 Empresa: *{{empresa}}*
+💼 Puesto: *{{puesto}}*
+🕗 Horario: *{{disponibilidad}}*
 
-Prepara tu documentación y llega 10 minutos antes. Si necesitas hacer algún cambio, responde este mensaje.
+📄 Prepara tu papelería en copia
+⏰ Llega 10 minutitos antes
 
-Mucho éxito mañana.`;
+Si necesitas cambiar el día, contéstame este mensaje con confianza 😊
+
+¡Mucho éxito mañana! 💪`;
 
 const DEFAULT_MSG_MANANA =
-  `Hola {{nombre}}, este es tu recordatorio de que *hoy* tienes tu entrevista de trabajo.
+`¡Buenos días {{nombre}}! ☀️ Hoy es tu entrevista 🎯
 
-Puesto: {{puesto}}
-Empresa: {{empresa}}
-Hora: {{disponibilidad}}
+🏭 Empresa: *{{empresa}}*
+💼 Puesto: *{{puesto}}*
+🕗 Horario: *{{disponibilidad}}*
 
-Recuerda llegar 10 minutos antes.`;
+📄 No se te olvide tu papelería
+⏰ Llega 10 minutitos antes
+
+¡Aquí te esperamos, mucho éxito! 💪`;
 
 function aplicarVariables(tpl: string, datos: Record<string, string>): string {
   let out = tpl;
@@ -134,7 +142,7 @@ async function procesarParaUsuario(usuario: any, tipo: "noche" | "manana") {
   // Contactos de este usuario con campo "disponibilidad"
   const { data: contactsRows } = await sb
     .from("contacts")
-    .select("id, phone, flow_id, status, bot_paused, contact_data(field_key, field_value)")
+    .select("id, phone, flow_id, status, bot_paused, cita_fecha, cita_hora, contact_data(field_key, field_value)")
     .in("flow_id", flowIds);
 
   if (!contactsRows?.length) {
@@ -142,12 +150,10 @@ async function procesarParaUsuario(usuario: any, tipo: "noche" | "manana") {
     return 0;
   }
 
-  const conDisponibilidad = contactsRows.filter(c => {
-    const datos: Record<string, string> = {};
-    (c.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
-    return !!datos.disponibilidad;
-  });
-  console.log(`Contactos totales: ${contactsRows.length} | Con disponibilidad: ${conDisponibilidad.length} | Objetivo: ${objetivoISO}`);
+  const conFecha = contactsRows.filter((c: any) => c.cita_fecha);
+  const paraHoy  = contactsRows.filter((c: any) => c.cita_fecha === objetivoISO);
+  console.log(`Contactos: ${contactsRows.length} | Con fecha guardada: ${conFecha.length} | ` +
+              `Para el objetivo ${objetivoISO}: ${paraHoy.length}`);
 
   let enviados = 0;
 
@@ -159,10 +165,12 @@ async function procesarParaUsuario(usuario: any, tipo: "noche" | "manana") {
       const datos: Record<string, string> = {};
       (contact.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
 
-      const disponibilidad = datos.disponibilidad;
-      if (!disponibilidad) continue;
-
-      const fechaCita = await interpretarFecha(disponibilidad);
+      // Se usa la fecha ya normalizada por el chatbot. Si por alguna razón
+      // no la tiene, se intenta interpretar el texto como respaldo.
+      let fechaCita: string | null = (contact as any).cita_fecha || null;
+      if (!fechaCita && datos.disponibilidad) {
+        fechaCita = await interpretarFecha(datos.disponibilidad);
+      }
       if (!fechaCita || fechaCita !== objetivoISO) continue;
 
       const flow = flowById[contact.flow_id];
@@ -214,16 +222,20 @@ async function revisarYEnviarRecordatorios() {
   const horaActual = redondear15(horaMonterreyActual());
   console.log(`Revisando recordatorios — hora Monterrey: ${horaActual}`);
 
-  const { data: usuarios } = await sb
-    .from("app_users")
-    .select("*")
-    .eq("is_active", true)
-    .eq("reminders_enabled", true);
+  const { data: todosUsuarios, error: errUsuarios } = await sb
+    .from("app_users").select("*").eq("is_active", true);
 
-  if (!usuarios?.length) {
-    console.log("Sin usuarios con recordatorios activos");
+  if (errUsuarios) console.error("Error leyendo usuarios:", errUsuarios);
+
+  // Solo se excluye a quien lo tenga apagado explícitamente.
+  // Si la columna nunca se configuró (null), el recordatorio sí corre.
+  const usuarios = (todosUsuarios || []).filter((u: any) => u.reminders_enabled !== false);
+
+  if (!usuarios.length) {
+    console.log(`Sin usuarios activos para recordatorios (total activos: ${todosUsuarios?.length || 0})`);
     return { revisados: 0, enviados: 0 };
   }
+  console.log(`Usuarios a revisar: ${usuarios.map((u: any) => u.username).join(", ")}`);
 
   let totalEnviados = 0;
   const resultadosPorUsuario: Record<string, any> = {};
@@ -231,6 +243,9 @@ async function revisarYEnviarRecordatorios() {
   for (const usuario of usuarios) {
     const horaNoche  = redondear15(usuario.reminder_hora_noche  || "21:00");
     const horaManana = redondear15(usuario.reminder_hora_manana || "08:00");
+    if (horaActual !== horaNoche && horaActual !== horaManana) {
+      console.log(`${usuario.username}: ahora ${horaActual}, sus horas son ${horaNoche} y ${horaManana} — no toca`);
+    }
 
     // Cada cliente se procesa de forma aislada — si uno falla, los demás
     // siguen su curso normal en esta misma corrida.
@@ -346,6 +361,67 @@ async function procesarNoShows() {
     }
   }
   return totalEnviados;
+}
+
+
+// ============================================================
+// DIAGNÓSTICO — POST { "diagnostico": true }
+// Dice por qué no están saliendo los recordatorios, sin enviar nada
+// ============================================================
+async function diagnosticoRecordatorios() {
+  const horaActual = redondear15(horaMonterreyActual());
+  const mty = new Date(Date.now() - 6 * 3600 * 1000);
+  const hoyISO = mty.toISOString().slice(0, 10);
+  const man = new Date(mty); man.setDate(man.getDate() + 1);
+  const mananaISO = man.toISOString().slice(0, 10);
+
+  const out: any = { hora_monterrey: horaActual, hoy: hoyISO, manana: mananaISO, usuarios: [] };
+
+  const { data: todos } = await sb.from("app_users").select("*").eq("is_active", true);
+  out.usuarios_activos = todos?.length || 0;
+
+  for (const u of (todos || [])) {
+    const hNoche  = redondear15(u.reminder_hora_noche  || "21:00");
+    const hManana = redondear15(u.reminder_hora_manana || "08:00");
+
+    const assigned: string[] = u.assigned_phones || [];
+    let q = sb.from("flows").select("id, name, whatsapp_phone");
+    if (u.role !== "admin" && assigned.length) q = q.in("whatsapp_phone", assigned);
+    const { data: flows } = await q;
+    const flowIds = (flows || []).map((f: any) => f.id);
+
+    let citasHoy = 0, citasManana = 0, sinFecha = 0, total = 0;
+    if (flowIds.length) {
+      const { data: cs } = await sb.from("contacts")
+        .select("cita_fecha, status, bot_paused, contact_data(field_key, field_value)")
+        .in("flow_id", flowIds);
+      total = cs?.length || 0;
+      (cs || []).forEach((c: any) => {
+        if (["contratado","rechazado","descartado"].includes(c.status)) return;
+        if (c.bot_paused) return;
+        if (c.cita_fecha === hoyISO)    citasHoy++;
+        if (c.cita_fecha === mananaISO) citasManana++;
+        const tieneTexto = (c.contact_data || []).some((d: any) => d.field_key === "disponibilidad" && d.field_value);
+        if (!c.cita_fecha && tieneTexto) sinFecha++;
+      });
+    }
+
+    out.usuarios.push({
+      usuario: u.username,
+      recordatorios_activos: u.reminders_enabled !== false,
+      hora_noche: hNoche,
+      hora_manana: hManana,
+      toca_ahora: horaActual === hNoche ? "noche" : horaActual === hManana ? "manana" : "no",
+      flujos: (flows || []).map((f: any) => f.name),
+      contactos: total,
+      citas_para_hoy: citasHoy,
+      citas_para_manana: citasManana,
+      con_texto_sin_fecha: sinFecha,
+    });
+  }
+
+  console.log("DIAGNÓSTICO:", JSON.stringify(out, null, 2));
+  return out;
 }
 
 // ============================================================
@@ -528,6 +604,15 @@ Deno.serve(async (req) => {
       }
 
       // Disparar resumen diario manualmente (para pruebas)
+      // Diagnóstico: explica por qué no salen los recordatorios
+      if (body?.diagnostico) {
+        const info = await diagnosticoRecordatorios();
+        return new Response(JSON.stringify(info, null, 2), {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+
       if (body?.resumen_diario) {
         await enviarResumenDiario();
         return new Response(JSON.stringify({ ok: true, message: "Resumen diario enviado" }), {
