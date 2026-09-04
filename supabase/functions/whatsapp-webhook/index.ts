@@ -623,7 +623,16 @@ async function sendMedia(to: string, url: string, from: string, apiKey: string, 
     body: JSON.stringify(payload),
   });
   const resText = await res.text();
-  console.log(`sendMedia (${tipo}) response:`, res.status, resText.slice(0, 200));
+  console.log(`sendMedia (${tipo}) → ${res.status}: ${resText.slice(0, 300)}`);
+
+  if (!res.ok) {
+    console.error(`[MEDIA-FALLO] tipo=${tipo} url=${url}`);
+    if (/mime|media|format|unsupported|invalid/i.test(resText)) {
+      console.error("[MEDIA-FALLO] WhatsApp rechazó el archivo. Formatos que acepta:");
+      console.error("  audio: mp3, aac, amr, m4a, ogg (solo con códec OPUS) — máx 16 MB");
+      console.error("  imagen: jpg, png — máx 5 MB   ·   video: mp4, 3gp — máx 16 MB");
+    }
+  }
 
   const etiqueta = tipo === "audio" ? "[Audio]" : tipo === "video" ? "[Video]"
                  : tipo === "document" ? "[Archivo]" : "[Imagen]";
