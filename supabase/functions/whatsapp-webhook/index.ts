@@ -1028,7 +1028,7 @@ async function handleRestart(phone: string, flowId: string, restartNode: any, cf
   }
   await sb.from("sessions").delete().eq("phone", phone);
   // Resetear el flag post_notified para que la notificación única vuelva a funcionar
-  await sb.from("contacts").update({ post_notified: false }).eq("phone", phone);
+  await sb.from("contacts").update({ post_notified: false, flujo_terminado: false }).eq("phone", phone);
   // 3. Encontrar el nodo destino:
   //    - Si el nodo restart tiene restart_node_key configurado → usar ese nodo
   //    - Si no → usar el nodo inicial del flujo (is_start)
@@ -1085,16 +1085,49 @@ async function autoAdvanceNode(phone: string, node: any, cfg: FlowConfig) {
   await executeNode(phone, nodeToSend, cfg);
 
   if (nextNode.type === "end") {
-    await sb.from("sessions").delete().eq("phone", phone);
-    await sb.from("contacts").update({ status: "en_proceso", updated_at: new Date().toISOString() }).eq("phone", phone);
-    await syncContactToSheet(phone);
-    // Notificaciones automáticas al finalizar el flujo
-    await enviarConfirmacionCandidato(phone, session.flow_id, cfg);
-    await notificarReclutadorFinFlujo(phone, session.flow_id, cfg);
+    await finalizarFlujo(phone, session.flow_id, nextNode, cfg);
   }
 
   if (nextNode.type === "restart") {
     await handleRestart(phone, session.flow_id, nextNode, cfg);
+  }
+}
+
+
+// ============================================================
+// CIERRE DEL FLUJO
+// Toda llegada a un nodo "end" marca flujo_terminado = true. Después de eso
+// el bot no vuelve a contestar aunque el candidato escriba "hola".
+// ¿Cierre exitoso o descarte? Se decide por si el candidato llegó a dar
+// su fecha de cita: todo candidato agendado la captura, y ningún descarte
+// llega a esa pregunta. Es más confiable que fijarse en el texto del nodo.
+// - Con fecha  → "en_proceso" y se avisa al reclutador.
+// - Sin fecha  → "descartado" y NO se notifica como candidato agendado.
+// ============================================================
+async function finalizarFlujo(phone: string, flowId: string, endNode: any, cfg: FlowConfig) {
+  await sb.from("sessions").delete().eq("phone", phone);
+
+  const { data: actual } = await sb.from("contacts")
+    .select("id, status, cita_fecha, contact_data(field_key, field_value)")
+    .eq("phone", phone).maybeSingle();
+  const yaDefinido = ESTATUS_FINALES.includes(String(actual?.status || ""));
+
+  const tieneCita = !!actual?.cita_fecha || (actual?.contact_data || []).some((d: any) =>
+    /disponibilidad|fecha|cita/i.test(d.field_key) && String(d.field_value || "").trim().length > 2);
+  const esDescarte = !tieneCita;
+
+  const cambios: any = { flujo_terminado: true, updated_at: new Date().toISOString() };
+  if (!yaDefinido) cambios.status = esDescarte ? "descartado" : "en_proceso";
+
+  await sb.from("contacts").update(cambios).eq("phone", phone);
+  await syncContactToSheet(phone);
+
+  console.log(`[FIN] ${phone} terminó el flujo (${esDescarte ? "descarte" : "cierre"}, estatus ${cambios.status || actual?.status})`);
+
+  // Solo el cierre exitoso manda confirmación y avisa al reclutador
+  if (!esDescarte && !yaDefinido) {
+    await enviarConfirmacionCandidato(phone, flowId, cfg);
+    await notificarReclutadorFinFlujo(phone, flowId, cfg);
   }
 }
 
@@ -1360,26 +1393,32 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     // Si ya existe un contacto que completo su registro anteriormente, no reiniciar
     // el flujo desde cero — eso le borraba el estatus y lo regresaba a "nuevo".
     const { data: contactoExistente } = await sb.from("contacts")
-      .select("status, flow_id, post_notified").eq("phone", phone).maybeSingle();
+      .select("status, flow_id, post_notified, flujo_terminado, wa_phone").eq("phone", phone).maybeSingle();
 
-    const estatusFinalizados = ["en_proceso", "contratado", "rechazado", "descartado", "no_responde"];
-    if (contactoExistente && estatusFinalizados.includes(contactoExistente.status)) {
+    const estatusFinalizados = ["en_proceso", "contratado", "rechazado", "descartado", "no_responde", "declino"];
+    const yaTermino = contactoExistente &&
+      (contactoExistente.flujo_terminado === true || estatusFinalizados.includes(contactoExistente.status));
 
-      // ── Verificar que el contacto existente pertenece a ESTE número de WhatsApp ──
-      // Si completó registro en otro número (otra empresa), dejarlo registrarse aquí
+    if (yaTermino) {
+
+      // ── ¿Le escribe al MISMO número que lo atendió? ──
+      // Mismo número → ya terminó, silencio.
+      // Otro número (otro reclutador, aunque sea del mismo flujo) → empieza de cero
+      // con ese reclutador, y el candidato pasa a ser suyo.
       let esMismoNumero = true;
-      if (contactoExistente.flow_id) {
+      let waExistente = contactoExistente.wa_phone || "";
+      if (!waExistente && contactoExistente.flow_id) {
         const { data: flowExistente } = await sb.from("flows")
           .select("whatsapp_phone").eq("id", contactoExistente.flow_id).maybeSingle();
-        const waExistente = flowExistente?.whatsapp_phone || "";
-        if (waExistente) {
-          esMismoNumero = waExistente === toPhoneNorm || waExistente === toPhonePlain;
-        }
+        waExistente = flowExistente?.whatsapp_phone || "";
+      }
+      if (waExistente) {
+        esMismoNumero = waExistente === toPhoneNorm || waExistente === toPhonePlain;
       }
 
       if (!esMismoNumero) {
         // Candidato escribió a un número diferente (otra empresa) — no bloquearlo
-        console.log(`${phone} completó registro en otro número → permitiendo nuevo registro en ${toPhone}`);
+        console.log(`[CAMBIO-RECLUTADOR] ${phone} ya terminó con ${waExistente}, escribe a ${toPhoneNorm} → empieza de cero`);
         // Continuar hacia el bloque de nuevo flujo (no hacer return)
       } else {
         // Candidato que ya terminó el flujo escribe de nuevo
@@ -1457,6 +1496,8 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
       {
         phone, flow_id: flow.id, status: "nuevo",
         wa_phone: toPhoneNorm,
+        flujo_terminado: false,
+        cita_fecha: null, cita_hora: null,   // la cita anterior ya no aplica
         recruiter_id: rec?.id || null,
         updated_at: new Date().toISOString(),
       },
@@ -1581,28 +1622,7 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
   await executeNode(phone, nodeToSend, cfg);
 
   if (nextNode.type === "end") {
-    await sb.from("sessions").delete().eq("phone", phone);
-
-    // Respetar un estatus ya asignado por una opción del flujo (ej: Declino)
-    const { data: actual } = await sb.from("contacts")
-      .select("status").eq("phone", phone).maybeSingle();
-    const yaDefinido = ESTATUS_FINALES.includes(String(actual?.status || ""));
-
-    if (yaDefinido) {
-      console.log(`[FIN] ${phone} conserva estatus "${actual?.status}" — no se marca en_proceso`);
-      await sb.from("contacts").update({ updated_at: new Date().toISOString() }).eq("phone", phone);
-      await syncContactToSheet(phone);
-      // Sin cita ni notificación al reclutador: el candidato no continúa el proceso
-      return;
-    }
-
-    await sb.from("contacts").update({
-      status: "en_proceso", updated_at: new Date().toISOString(),
-    }).eq("phone", phone);
-    await syncContactToSheet(phone);
-    // Notificaciones automáticas al finalizar el flujo
-    await enviarConfirmacionCandidato(phone, session.flow_id, cfg);
-    await notificarReclutadorFinFlujo(phone, session.flow_id, cfg);
+    await finalizarFlujo(phone, session.flow_id, nextNode, cfg);
   }
 
   if (nextNode.type === "restart") {
