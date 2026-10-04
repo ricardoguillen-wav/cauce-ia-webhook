@@ -1094,6 +1094,10 @@ async function autoAdvanceNode(phone: string, node: any, cfg: FlowConfig) {
 }
 
 
+// Número que recibe SIEMPRE el aviso de candidato agendado, en todos los flujos,
+// además de los que tenga configurados cada flujo o reclutador
+const AVISO_PREDETERMINADO = "+528146052592";
+
 // ============================================================
 // CIERRE DEL FLUJO
 // Toda llegada a un nodo "end" marca flujo_terminado = true. Después de eso
@@ -1293,15 +1297,25 @@ async function notificarReclutadorFinFlujo(phone: string, flowId: string, cfg: F
       .select("name, notify_phone, recruiter_name")
       .eq("id", flowId).maybeSingle();
 
-    const notifyPhones = (flow?.notify_phone || '')
-      .split(/[,\n]/)
-      .map((p: string) => p.trim())
-      .filter((p: string) => p.length > 6);
+    // Destinatarios: los del flujo, los del reclutador que atendió, y siempre el predeterminado
+    const crudos = [
+      flow?.notify_phone || '',
+      cfg?.rec?.notify_phone || '',
+      AVISO_PREDETERMINADO,
+    ].join(',');
 
-    if (!notifyPhones.length) {
-      console.log(`Sin notify_phone en flujo ${flowId} — omitiendo notificación`);
-      return;
-    }
+    const normalizar = (t: string) => {
+      const dig = t.replace(/\D/g, '');
+      if (!dig) return '';
+      if (dig.length === 10) return '+52' + dig;        // 8146052592 → +528146052592
+      return '+' + dig;
+    };
+
+    const notifyPhones = [...new Set(
+      crudos.split(/[,\n]/)
+        .map((p: string) => normalizar(p.trim()))
+        .filter((p: string) => p.length > 10)
+    )];
 
     // Datos capturados del candidato
     const { data: contact } = await sb.from("contacts")
@@ -1505,7 +1519,8 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     );
     // Guardar sesión — usar onConflict "phone" (el índice que ya existe en la BD)
     await sb.from("sessions").upsert(
-      { phone, to_phone: toPhoneNorm, flow_id: flow.id, current_node: firstNode.node_key, updated_at: new Date().toISOString() },
+      { phone, to_phone: toPhoneNorm, flow_id: flow.id, current_node: firstNode.node_key,
+        updated_at: new Date().toISOString(), abandono_avisado: false },
       { onConflict: "phone" }
     );
 
@@ -1614,8 +1629,10 @@ async function processMessage(phone: string, userMessage: string, toPhone: strin
     .eq("flow_id", session.flow_id).eq("node_key", edge.to_node).maybeSingle();
   if (!nextNode) { console.log("NEXT NODE NOT FOUND:", edge.to_node); return; }
 
+  // El candidato respondió: se reinicia el reloj del recordatorio por abandono
   await sb.from("sessions").update({
     current_node: edge.to_node, updated_at: new Date().toISOString(),
+    abandono_avisado: false,
   }).eq("phone", phone);
 
   const nodeToSend = { ...nextNode, content: await resolveVariables(nextNode.content, phone, cfg.rec) };
