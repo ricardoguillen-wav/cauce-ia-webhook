@@ -775,6 +775,21 @@ async function getGoogleAccessToken(): Promise<string | null> {
   }
 }
 
+// Nombre de la hoja de cálculo, para mostrarlo en la plataforma
+async function sheetsTitulo(sheetId: string): Promise<{ titulo: string | null; error?: string }> {
+  const token = await getGoogleAccessToken();
+  if (!token) return { titulo: null, error: "Sin credenciales de Google" };
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=properties.title`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (res.status === 403) return { titulo: null, error: "Sin permiso: comparte la hoja con la cuenta de servicio" };
+  if (res.status === 404) return { titulo: null, error: "No existe una hoja con ese ID" };
+  if (!res.ok) return { titulo: null, error: `Error ${res.status}` };
+  const j = await res.json();
+  return { titulo: j?.properties?.title || null };
+}
+
 async function sheetsGet(sheetId: string, range: string): Promise<any> {
   const token = await getGoogleAccessToken();
   if (!token) return null;
@@ -855,20 +870,40 @@ async function syncContactToSheet(phone: string, forceNew: boolean = false) {
     if (!contact) return;
 
     const { data: flow } = await sb.from("flows")
-      .select("whatsapp_phone, name").eq("id", contact.flow_id).maybeSingle();
-    if (!flow?.whatsapp_phone) return;
+      .select("whatsapp_phone, name, recruiter_name").eq("id", contact.flow_id).maybeSingle();
+
+    // La hoja es la del número que ATENDIÓ al candidato. Antes se tomaba la del
+    // número del flujo, y con varios reclutadores todo caía en la hoja de uno solo.
+    const telAtendio = contact.wa_phone || flow?.whatsapp_phone || "";
+    if (!telAtendio) return;
 
     const { data: waNumber } = await sb.from("wa_numbers")
-      .select("google_sheet_id").eq("phone", flow.whatsapp_phone).maybeSingle();
+      .select("google_sheet_id, label").eq("phone", telAtendio).maybeSingle();
     const sheetId = waNumber?.google_sheet_id;
     if (!sheetId) return;
+
+    // ¿Quién lo reclutó? Varios reclutadores pueden compartir la misma hoja
+    let reclutador = "";
+    if (contact.recruiter_id) {
+      const { data: r } = await sb.from("flow_recruiters")
+        .select("nombre").eq("id", contact.recruiter_id).maybeSingle();
+      reclutador = r?.nombre || "";
+    }
+    if (!reclutador) {
+      const { data: r } = await sb.from("flow_recruiters")
+        .select("nombre").eq("whatsapp_phone", telAtendio).maybeSingle();
+      reclutador = r?.nombre || "";
+    }
+    if (!reclutador) reclutador = flow?.recruiter_name || waNumber?.label || "";
 
     const datos: Record<string, string> = {};
     (contact.contact_data || []).forEach((d: any) => { datos[d.field_key] = d.field_value; });
 
     // Columnas dinámicas: Telefono + Fecha + los campos que captura este flujo + Estatus
     const captureFields = await getFlowCaptureFields(contact.flow_id);
-    const COLS = ["Telefono", "Fecha", ...captureFields.map(tituloCampo), "Estatus"];
+    // "Reclutador" va al final a propósito: si se insertara en medio, las filas
+    // que ya existen quedarían con los datos desfasados una columna
+    const COLS = ["Telefono", "Fecha", ...captureFields.map(tituloCampo), "Estatus", "Reclutador"];
 
     // Asegurar encabezado (si la hoja es nueva o cambió el flujo)
     const headerData = await sheetsGet(sheetId, `A1:${String.fromCharCode(65 + COLS.length - 1)}1`);
@@ -884,6 +919,7 @@ async function syncContactToSheet(phone: string, forceNew: boolean = false) {
       fecha,
       ...captureFields.map(f => datos[f] || ""),
       contact.status || "nuevo",
+      reclutador,
     ];
 
     if (forceNew) {
@@ -1916,6 +1952,14 @@ Deno.serve(async (req) => {
   try {
     const body = await req.json();
     console.log("Body:", JSON.stringify(body));
+
+    // ── Consulta del nombre de una hoja (lo usa la plataforma) ──
+    if (body?.sheet_titulo) {
+      const r = await sheetsTitulo(String(body.sheet_titulo));
+      return new Response(JSON.stringify(r), {
+        status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
     // ── Eventos que NO son mensajes entrantes ──
     const tipoEvento = body?.type || "";
