@@ -364,6 +364,110 @@ async function procesarNoShows() {
 }
 
 
+
+// ============================================================
+// RECORDATORIO POR ABANDONO
+// Si el candidato dejó el flujo a medias y no ha contestado en 1 hora,
+// se le manda UN recordatorio amable. Una sola vez por abandono: si vuelve
+// a contestar, el webhook reinicia el contador.
+// ============================================================
+const TEL_DUDAS = "81 4605 2592";
+
+const MSG_ABANDONO =
+`¡Hola{{coma_nombre}}! 👋
+
+Vi que nos quedamos a medio camino con tu registro 😊
+
+Si tienes *alguna duda*, con toda confianza puedes:
+📞 *Marcarme* al ${TEL_DUDAS}
+💬 *Enviarme mensaje* aquí mismo o a ese número
+
+Y si quieres seguir con tu registro, solo contesta la última pregunta que te hice 👆
+
+¡Aquí estoy para ayudarte! 💪`;
+
+async function procesarAbandonos() {
+  // Solo de 7 am a 10 pm hora Monterrey, para no escribir de madrugada
+  const mty  = new Date(Date.now() - 6 * 3600 * 1000);
+  const hora = mty.getUTCHours();
+  if (hora < 7 || hora >= 22) {
+    console.log(`[ABANDONO] ${hora}h Monterrey — fuera de horario, se omite`);
+    return 0;
+  }
+
+  const haceUnaHora = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  // Más de 23 h: la ventana de 24 h de WhatsApp ya casi cierra, no vale la pena
+  const hace23Horas = new Date(Date.now() - 23 * 3600 * 1000).toISOString();
+
+  const { data: sesiones, error } = await sb.from("sessions")
+    .select("phone, to_phone, flow_id, current_node, updated_at, abandono_avisado")
+    .lt("updated_at", haceUnaHora)
+    .gt("updated_at", hace23Horas);
+
+  if (error) { console.error("[ABANDONO] error leyendo sesiones:", error); return 0; }
+
+  const pendientes = (sesiones || []).filter((s: any) => s.abandono_avisado !== true);
+  if (!pendientes.length) return 0;
+
+  let enviados = 0;
+  for (const sesion of pendientes) {
+    try {
+      // No molestar a quien ya terminó o tiene el bot pausado
+      const { data: c } = await sb.from("contacts")
+        .select("bot_paused, flujo_terminado, opted_out, contact_data(field_key, field_value)")
+        .eq("phone", sesion.phone).maybeSingle();
+      if (c?.flujo_terminado || c?.bot_paused || c?.opted_out) {
+        await sb.from("sessions").update({ abandono_avisado: true }).eq("phone", sesion.phone);
+        continue;
+      }
+
+      // ¿Desde qué número y con qué llave? Primero el reclutador, luego el flujo
+      const tel = sesion.to_phone || "";
+      let from = tel, apiKey = YCLOUD_KEY_FALLBACK;
+      const { data: rec } = await sb.from("flow_recruiters")
+        .select("whatsapp_phone, ycloud_api_key").eq("whatsapp_phone", tel).maybeSingle();
+      if (rec?.ycloud_api_key) apiKey = rec.ycloud_api_key;
+      if (!rec) {
+        const { data: f } = await sb.from("flows")
+          .select("whatsapp_phone, ycloud_api_key").eq("id", sesion.flow_id).maybeSingle();
+        if (f?.ycloud_api_key) apiKey = f.ycloud_api_key;
+        if (!from) from = f?.whatsapp_phone || "";
+      }
+      if (!from || !apiKey) continue;
+
+      const nombre = (c?.contact_data || []).find((d: any) => d.field_key === "nombre")?.field_value || "";
+      const primer = nombre.trim().split(/\s+/)[0] || "";
+      const texto  = MSG_ABANDONO.replace("{{coma_nombre}}", primer ? ` ${primer}` : "");
+
+      const res = await fetch(YCLOUD_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
+        body: JSON.stringify({ from, to: sesion.phone, type: "text", text: { body: texto } }),
+      });
+
+      // Se marca aunque falle, para no reintentar cada 15 minutos
+      await sb.from("sessions").update({ abandono_avisado: true }).eq("phone", sesion.phone);
+
+      await sb.from("message_log").insert({
+        phone: sesion.phone, direction: "out", content: texto,
+        node_key: "recordatorio_abandono", status: res.ok ? "sent" : "failed",
+      }).catch(() => {});
+
+      if (res.ok) {
+        enviados++;
+        console.log(`[ABANDONO] recordatorio a ${sesion.phone} (en ${sesion.current_node})`);
+      } else {
+        console.log(`[ABANDONO] falló ${sesion.phone}: ${res.status} ${(await res.text()).slice(0, 120)}`);
+      }
+    } catch (e) {
+      console.error(`[ABANDONO] error con ${sesion.phone}:`, e);
+    }
+  }
+
+  console.log(`[ABANDONO] ${enviados} recordatorios enviados de ${pendientes.length} pendientes`);
+  return enviados;
+}
+
 // ============================================================
 // DIAGNÓSTICO — POST { "diagnostico": true }
 // Dice por qué no están saliendo los recordatorios, sin enviar nada
@@ -431,6 +535,7 @@ Deno.cron("revisar-recordatorios", "*/15 * * * *", async () => {
   console.log("CRON ejecutándose...", new Date().toISOString());
   await revisarYEnviarRecordatorios();
   await procesarNoShows();
+  await procesarAbandonos();
 });
 
 // ============================================================
@@ -604,6 +709,14 @@ Deno.serve(async (req) => {
       }
 
       // Disparar resumen diario manualmente (para pruebas)
+      // Recordatorio por abandono, a mano
+      if (body?.abandonos) {
+        const n = await procesarAbandonos();
+        return new Response(JSON.stringify({ ok: true, enviados: n }), {
+          status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+
       // Diagnóstico: explica por qué no salen los recordatorios
       if (body?.diagnostico) {
         const info = await diagnosticoRecordatorios();
